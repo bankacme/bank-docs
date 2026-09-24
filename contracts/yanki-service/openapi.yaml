@@ -1,0 +1,750 @@
+openapi: 3.0.3
+info:
+  title: yanki-service
+  version: 1.0.0
+  description: |
+    Monederos móviles Yanki y pagos entre ellos usando solo el **número de celular**. **Servicio de P3: no llama por REST a ningún otro servicio**;
+    valida con copias locales (clientes y tarjetas de débito) y pide los movimientos de cuenta a `transaction-service` por Kafka.
+
+    - **Monedero.** Una persona, un monedero activo: documento, celular y usuario únicos entre los monederos `ACTIVE`. **No exige ser cliente del banco.**
+      El **documento sale del token** (`documentType`, `documentNumber`), nunca del cuerpo, y solo puede ser DNI, CEX o PASSPORT (una empresa con RUC recibe 422 `DOCUMENT_TYPE_NOT_ALLOWED`).
+      El dueño es el `sub` del token. Registro completo: `POST /auth/register` → `POST /auth/login` → `POST /wallets`; un cliente del banco que ya tiene usuario salta el primer paso.
+    - **Dos modos.** *Independiente* (`STANDALONE`): tiene saldo propio. *Asociado* (`LINKED`): está asociado a una tarjeta de débito, **no tiene saldo propio** y enviar o recibir mueve la **cuenta principal** de la tarjeta.
+      No hay recargas: el primer saldo de un monedero independiente llega recibiendo un pago de uno asociado.
+    - **Pago.** Saga **orquestada** por este servicio: 1) debitar al emisor, 2) acreditar al receptor, 3) si el paso 2 es rechazado, devolver el paso 1. Cada paso es local (saldo del monedero) o remoto (cuenta bancaria vía `transaction-service`),
+      así que hay cuatro rutas. Nunca se compensa por un tiempo agotado: se reintenta la misma pata con el mismo identificador.
+    - **Espera de 1,5 s.** El `POST` de un pago espera hasta 1,5 s (`payment.await-timeout`, configurable) el estado terminal. Si llega: **201** (completado) o **422** (rechazado).
+      Si no llega: **202** con el pago en curso; el cliente consulta el pago o repite con el **mismo `operationId`**. La saga termina igual por su cuenta.
+    - **Privacidad.** El receptor se identifica solo por celular; al emisor se le muestra su celular **enmascarado** y ningún otro dato. El IMEI nunca se devuelve completo. Los datos personales no se escriben completos en los logs.
+    - **Deuda vencida (RF-60)** no aplica a Yanki.
+
+    Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`. Este servicio necesita la identidad del token (documento y `sub`), por lo que **no se usa sin seguridad activa** fuera de las pruebas.
+servers:
+  - url: /api/v1
+tags:
+  - name: Wallets
+  - name: Wallet cards
+  - name: Wallet payments
+  - name: Internal
+    description: Solo para el administrador.
+security:
+  - bearerAuth: []
+
+paths:
+
+  /wallets:
+    post:
+      tags: [Wallets]
+      operationId: openWallet
+      summary: Crear mi monedero
+      x-roles: [YANKI_USER, CUSTOMER]
+      description: |
+        Crea el monedero del usuario del token, **independiente y con saldo 0**. El documento es el del token. Nace `ACTIVE`. Publica `yanki.wallet.created`.
+
+        Errores: 400 `VALIDATION_ERROR`; 409 `USER_ALREADY_HAS_WALLET`, `DOCUMENT_ALREADY_REGISTERED`, `PHONE_ALREADY_REGISTERED` (solo cuentan los monederos `ACTIVE`; se evalúan en ese orden);
+        422 `DOCUMENT_TYPE_NOT_ALLOWED` (el documento del token es RUC).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenWalletRequest'
+            example:
+              phoneNumber: '943210987'
+              imei: '490154203237518'
+              email: diana.flores@example.com
+      responses:
+        '201':
+          description: Monedero creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    get:
+      tags: [Wallets]
+      operationId: listWallets
+      summary: Listar monederos
+      x-roles: [ADMIN, TELLER]
+      description: Sin paginación. Filtro opcional por estado. Orden `createdAt` descendente y `id`.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/WalletStatus'
+      responses:
+        '200':
+          description: Monederos que cumplen el filtro (lista vacía si ninguno).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Wallet'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /wallets/me:
+    get:
+      tags: [Wallets]
+      operationId: getMyWallet
+      summary: Mi monedero
+      x-roles: [YANKI_USER, CUSTOMER]
+      description: El monedero `ACTIVE` del usuario del token. 404 `WALLET_NOT_FOUND` si no tiene (o solo tuvo uno ya cerrado).
+      responses:
+        '200':
+          description: Monedero.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /wallets/{id}:
+    parameters:
+      - $ref: '#/components/parameters/WalletIdPath'
+    get:
+      tags: [Wallets]
+      operationId: getWallet
+      summary: Obtener un monedero
+      x-roles: [ADMIN, TELLER, YANKI_USER, CUSTOMER]
+      x-customer-scope: Un `YANKI_USER` o `CUSTOMER` solo ve el suyo (403 si es de otro).
+      responses:
+        '200':
+          description: Monedero (también si está cerrado).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Wallets]
+      operationId: updateWallet
+      summary: Actualizar correo e IMEI
+      x-roles: [ADMIN, YANKI_USER, CUSTOMER]
+      x-customer-scope: Un `YANKI_USER` o `CUSTOMER` solo modifica el suyo.
+      description: |
+        Documento y celular **no cambian**. Ambos campos son obligatorios. 422 `WALLET_INACTIVE` si el monedero está cerrado. Publica `yanki.wallet.updated`.
+        409 `CONCURRENT_MODIFICATION` si se agotan los reintentos por conflicto de versión.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWalletRequest'
+      responses:
+        '200':
+          description: Monedero actualizado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Wallets]
+      operationId: closeWallet
+      summary: Cerrar un monedero (baja lógica)
+      x-roles: [ADMIN, YANKI_USER, CUSTOMER]
+      x-customer-scope: Un `YANKI_USER` o `CUSTOMER` solo cierra el suyo.
+      description: |
+        Pasa a `CLOSED` y publica `yanki.wallet.closed`. Repetir el cierre responde 204 sin publicar de nuevo. Un monedero cerrado no envía ni recibe, y su celular, documento y usuario quedan libres para un monedero nuevo.
+        Errores 422: `WALLET_HAS_BALANCE` (saldo distinto de 0), `WALLET_HAS_CARD` (tiene tarjeta asociada: desasociarla primero), `WALLET_HAS_PAYMENTS_IN_PROGRESS` (como emisor o receptor).
+      responses:
+        '204':
+          description: Monedero cerrado.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /wallets/{id}/balance:
+    parameters:
+      - $ref: '#/components/parameters/WalletIdPath'
+    get:
+      tags: [Wallets]
+      operationId: getWalletBalance
+      summary: Saldo del monedero
+      x-roles: [ADMIN, TELLER, YANKI_USER, CUSTOMER]
+      x-customer-scope: Un `YANKI_USER` o `CUSTOMER` solo ve el suyo.
+      description: |
+        `STANDALONE`: devuelve el saldo propio. `LINKED`: no hay saldo propio; devuelve la tarjeta y el identificador de la cuenta principal
+        (el saldo real está en `account-service`; este servicio no lo conoce ni llama para pedirlo).
+      responses:
+        '200':
+          description: Saldo o modo asociado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletBalance'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /wallets/{id}/debit-card:
+    parameters:
+      - $ref: '#/components/parameters/WalletIdPath'
+    put:
+      tags: [Wallet cards]
+      operationId: linkDebitCard
+      summary: Asociar el monedero a una tarjeta de débito
+      x-roles: [YANKI_USER, CUSTOMER]
+      x-customer-scope: Solo el dueño del monedero.
+      description: |
+        La tarjeta debe existir en la copia local (`debit-card`), estar `ACTIVE` y no vencida, tener como titular a alguien con el **mismo documento** que el monedero
+        y no estar asociada a otro monedero. El monedero debe estar `ACTIVE`, con **saldo 0**, sin tarjeta y sin pagos en curso.
+        Desde ese momento el monedero es `LINKED` (sin saldo propio). Repetir con la **misma** tarjeta responde 200 sin cambios.
+        Publica `yanki.wallet.card.linked`.
+
+        Errores 422: `WALLET_INACTIVE`, `WALLET_HAS_BALANCE`, `WALLET_HAS_PAYMENTS_IN_PROGRESS`, `WALLET_ALREADY_LINKED` (ya tiene **otra** tarjeta), `CARD_NOT_FOUND`, `CARD_NOT_ACTIVE`, `CARD_OWNER_MISMATCH`, `CARD_ALREADY_LINKED`.
+        Las copias locales son eventualmente consistentes: una tarjeta recién emitida puede responder `CARD_NOT_FOUND` unos instantes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkCardRequest'
+      responses:
+        '200':
+          description: Monedero asociado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Wallet cards]
+      operationId: unlinkDebitCard
+      summary: Desasociar la tarjeta de débito
+      x-roles: [YANKI_USER, CUSTOMER]
+      x-customer-scope: Solo el dueño del monedero.
+      description: |
+        Se permite siempre (incluso con pagos en curso: su ruta ya está fijada). El monedero vuelve a ser `STANDALONE` con saldo 0. Si no tenía tarjeta, responde 200 sin cambios.
+        Publica `yanki.wallet.card.unlinked`. Si la tarjeta se cierra en `debit-service`, este servicio lo hace solo.
+      responses:
+        '200':
+          description: Monedero independiente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+
+  /wallets/{id}/payments:
+    parameters:
+      - $ref: '#/components/parameters/WalletIdPath'
+    post:
+      tags: [Wallet payments]
+      operationId: sendWalletPayment
+      summary: Enviar un pago por celular
+      x-roles: [YANKI_USER, CUSTOMER]
+      x-customer-scope: Solo el dueño del monedero emisor (403 si es de otro).
+      description: |
+        Orden de las comprobaciones: (1) el monedero existe y es del usuario (404, 403); (2) **idempotencia**: si el `operationId` ya tiene un pago, se compara (monedero emisor, monto y celular del receptor;
+        si difieren, 409 `OPERATION_ID_REUSED`) y se devuelve el estado actual, aunque el monedero ya se haya cerrado; (3) el emisor está `ACTIVE` (422 `WALLET_INACTIVE`);
+        (4) existe un monedero `ACTIVE` con ese celular (422 `RECEIVER_NOT_FOUND`); (5) emisor distinto del receptor (422 `SAME_WALLET`);
+        (6) si un monedero está asociado, su tarjeta debe estar `ACTIVE` en la copia local (emisor: 422 `CARD_NOT_ACTIVE`; receptor: 422 `RECEIVER_NOT_FOUND`, sin revelar el motivo);
+        (7) si el emisor es independiente, el saldo alcanza (422 `INSUFFICIENT_FUNDS`). Con (3) a (7) fallando **no se crea ningún pago**.
+
+        Se resuelve la **ruta** (origen y destino, cada uno saldo del monedero o cuenta principal de su tarjeta) y se **fija** para toda la saga. Después se guarda el pago `STARTED`, se ejecutan los pasos locales,
+        se pide el primer paso remoto (si lo hay) y se espera hasta 1,5 s el estado terminal.
+
+        | Situación | Respuesta |
+        |---|---|
+        | Completado a tiempo | 201, pago `COMPLETED` |
+        | Débito rechazado (`INSUFFICIENT_FUNDS`, `MONTHLY_LIMIT_EXCEEDED`, `ACCOUNT_INACTIVE`, ...) | 422 con el `code` del motivo, el `paymentId` y `paymentStatus = FAILED`. No se movió dinero |
+        | Crédito rechazado y débito devuelto | 422 con el `code` del motivo del crédito, el `paymentId` y `paymentStatus = COMPENSATED` |
+        | Sin estado terminal en 1,5 s | 202, pago `STARTED`, `SOURCE_DEBITED` o `COMPENSATING`. Consultar el pago o repetir con el mismo `operationId` |
+        | La devolución no se pudo hacer | 202, pago `COMPENSATION_FAILED` (terminal; revisión manual del administrador) |
+        | Repetición | `COMPLETED` → 200; `FAILED` o `COMPENSATED` → 422 con el mismo código; en curso → se retoma el paso pendiente y se espera otra vez hasta 2 s (200, 422 o 202); `COMPENSATION_FAILED` → 202 |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendPaymentRequest'
+            example:
+              operationId: 9d2a7f10-4b3c-4e8a-a1d2-5c6b7e8f9a01
+              receiverPhone: '943210987'
+              amount: 30.00
+              description: Almuerzo
+      responses:
+        '200':
+          description: Repetición de un pago que ya estaba `COMPLETED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletPayment'
+        '201':
+          description: Pago completado dentro de los 1,5 s.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletPayment'
+              example:
+                id: 5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d
+                walletId: 8c7b6a59-4d3e-4f2a-9b1c-0d9e8f7a6b5c
+                direction: SENT
+                operationId: 9d2a7f10-4b3c-4e8a-a1d2-5c6b7e8f9a01
+                counterpartMaskedPhone: '*** *** 987'
+                amount: 30.00
+                description: Almuerzo
+                status: COMPLETED
+                requestedAt: '2026-09-24T15:24:00Z'
+                completedAt: '2026-09-24T15:24:01Z'
+        '202':
+          description: Sin estado terminal en 1,5 s (o `COMPENSATION_FAILED`). Repetir con el mismo `operationId` o consultar el pago.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletPayment'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/PaymentRejected'
+    get:
+      tags: [Wallet payments]
+      operationId: listWalletPayments
+      summary: Pagos enviados y recibidos de un monedero
+      x-roles: [ADMIN, TELLER, YANKI_USER, CUSTOMER]
+      x-customer-scope: Un `YANKI_USER` o `CUSTOMER` solo ve los de su monedero.
+      description: |
+        Más recientes primero (`requestedAt` descendente, empate por `id`). Fechas inclusivas, en la zona horaria del banco; sin `from`/`to` no hay límite.
+        `direction=SENT`: los que envió el monedero, en **cualquier estado**. `direction=RECEIVED`: solo los **`COMPLETED`** (un pago que no llegó a completarse no es del receptor).
+        Sin `direction`: ambos. Cada elemento se ve desde el monedero de la ruta: `direction`, `counterpartMaskedPhone` y `operationId` (solo en los enviados).
+        400 `INVALID_DATE_RANGE` si `from` es posterior a `to`.
+      parameters:
+        - name: direction
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/PaymentDirection'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/FromParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/ToParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/PageParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: Página de pagos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletPaymentPage'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /wallets/{id}/payments/{paymentId}:
+    parameters:
+      - $ref: '#/components/parameters/WalletIdPath'
+      - name: paymentId
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    get:
+      tags: [Wallet payments]
+      operationId: getWalletPayment
+      summary: Estado de un pago
+      x-roles: [ADMIN, TELLER, YANKI_USER, CUSTOMER]
+      x-customer-scope: Un `YANKI_USER` o `CUSTOMER` solo ve los de su monedero.
+      description: |
+        Se usa tras un 202 para saber cómo terminó. 404 `WALLET_PAYMENT_NOT_FOUND` si el pago no existe o **no es visible** para ese monedero
+        (el emisor lo ve en cualquier estado; el receptor solo si está `COMPLETED`).
+      responses:
+        '200':
+          description: Pago, visto desde el monedero de la ruta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletPayment'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /wallet-payment-recovery-runs:
+    post:
+      tags: [Internal]
+      operationId: runWalletPaymentRecovery
+      summary: Ejecutar ahora la recuperación de pagos en curso
+      x-roles: [ADMIN]
+      description: |
+        Hace lo mismo que el proceso programado: retoma los pagos `STARTED`, `SOURCE_DEBITED` o `COMPENSATING` sin avanzar hace más de N minutos, con las **mismas** identificaciones de pata
+        (`<op>-OUT`, `<op>-IN`, `<op>-REV`) y la ruta guardada. Repite el paso local o reenvía el comando remoto. **Nunca compensa por un tiempo agotado**: solo un rechazo explícito lleva a `COMPENSATING`.
+        Un pago en `COMPENSATING` con la devolución remota sin respuesta tras `yanki.compensation.max-attempts` intentos pasa a `COMPENSATION_FAILED`.
+        Un pago reintentado el máximo de veces (`yanki.recovery.max-attempts`) deja de reenviarse y se cuenta en `exhausted`.
+        Para la demo, `olderThanMinutes=0` los toma todos.
+      parameters:
+        - name: olderThanMinutes
+          in: query
+          required: false
+          description: Antigüedad mínima en minutos. Por defecto, el valor configurado.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1440
+      responses:
+        '200':
+          description: Resultado de la corrida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryResult'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+components:
+
+  parameters:
+    WalletIdPath:
+      name: id
+      in: path
+      required: true
+      description: Identificador del monedero.
+      schema:
+        $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+  responses:
+    PaymentRejected:
+      description: |
+        No se pudo pagar. Con `paymentId`: el pago existe y terminó en `FAILED` (el débito fue rechazado) o `COMPENSATED` (el crédito fue rechazado y el débito se devolvió);
+        el `code` es el motivo de la cuenta o del monedero que rechazó. Sin `paymentId`: se rechazó **antes** de crear el pago.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '../common/common-schemas.yaml#/components/schemas/ErrorResponse'
+              - type: object
+                properties:
+                  paymentId:
+                    $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+                  paymentStatus:
+                    $ref: '#/components/schemas/WalletPaymentStatus'
+
+  schemas:
+
+    RequestOperationId:
+      type: string
+      description: |
+        Identificador de idempotencia del cliente (UUID recomendado). Máximo **56** caracteres: el servicio genera las patas `<op>-OUT`, `<op>-IN` y `<op>-REV`,
+        y `transaction-service` le agrega `-FEE` a la comisión de cada una (hasta 8 caracteres de sufijo en total); todo debe caber en los 64 del `OperationId` común.
+        Comparte espacio con los `operationId` de depósitos, retiros, transferencias y pagos con débito: usar un UUID nuevo para cada operación.
+      minLength: 8
+      maxLength: 56
+      example: 9d2a7f10-4b3c-4e8a-a1d2-5c6b7e8f9a01
+
+    PhoneNumber:
+      type: string
+      description: Celular de 9 dígitos que empieza con 9.
+      pattern: '^9[0-9]{8}$'
+      example: '943210987'
+
+    MaskedPhone:
+      type: string
+      description: Solo los últimos 3 dígitos.
+      example: '*** *** 987'
+
+    WalletStatus:
+      type: string
+      enum: [ACTIVE, CLOSED]
+
+    WalletMode:
+      type: string
+      enum: [STANDALONE, LINKED]
+      description: '`STANDALONE` con saldo propio; `LINKED` asociado a una tarjeta de débito (sin saldo propio).'
+
+    WalletPaymentStatus:
+      type: string
+      enum: [STARTED, SOURCE_DEBITED, COMPLETED, FAILED, COMPENSATING, COMPENSATED, COMPENSATION_FAILED]
+      description: |
+        `STARTED` (creado; el débito está en curso), `SOURCE_DEBITED` (emisor debitado; falta acreditar), `COMPLETED`, `FAILED` (débito rechazado; nada se movió),
+        `COMPENSATING` (crédito rechazado; falta devolver), `COMPENSATED` (devuelto), `COMPENSATION_FAILED` (no se pudo devolver; revisión manual).
+        Terminales: `COMPLETED`, `FAILED`, `COMPENSATED`, `COMPENSATION_FAILED`.
+
+    PaymentDirection:
+      type: string
+      enum: [SENT, RECEIVED]
+
+    OpenWalletRequest:
+      type: object
+      required: [phoneNumber, imei, email]
+      properties:
+        phoneNumber:
+          $ref: '#/components/schemas/PhoneNumber'
+        imei:
+          type: string
+          description: 15 dígitos. No se devuelve completo.
+          pattern: '^[0-9]{15}$'
+          example: '490154203237518'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+
+    UpdateWalletRequest:
+      type: object
+      required: [imei, email]
+      properties:
+        imei:
+          type: string
+          pattern: '^[0-9]{15}$'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+
+    LinkCardRequest:
+      type: object
+      required: [cardId]
+      properties:
+        cardId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+    SendPaymentRequest:
+      type: object
+      required: [operationId, receiverPhone, amount]
+      properties:
+        operationId:
+          $ref: '#/components/schemas/RequestOperationId'
+        receiverPhone:
+          $ref: '#/components/schemas/PhoneNumber'
+        amount:
+          type: number
+          minimum: 0.01
+          multipleOf: 0.01
+          description: Mayor que 0, hasta 2 decimales, en soles.
+          example: 30.00
+        description:
+          type: string
+          maxLength: 200
+
+    Wallet:
+      type: object
+      required: [id, ownerUserId, document, phoneNumber, maskedImei, email, mode, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        ownerUserId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        document:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Document'
+        phoneNumber:
+          $ref: '#/components/schemas/PhoneNumber'
+        maskedImei:
+          type: string
+          description: Solo los últimos 4 dígitos.
+          example: '***********7518'
+        email:
+          type: string
+          format: email
+        mode:
+          $ref: '#/components/schemas/WalletMode'
+        linkedCardId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Presente solo si `mode = LINKED`.
+        status:
+          $ref: '#/components/schemas/WalletStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    WalletBalance:
+      type: object
+      required: [walletId, mode, currency]
+      properties:
+        walletId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        mode:
+          $ref: '#/components/schemas/WalletMode'
+        currency:
+          type: string
+          enum: [PEN]
+        balance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Solo si `STANDALONE`.
+        cardId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Solo si `LINKED`.
+        cardMaskedNumber:
+          type: string
+          description: Solo si `LINKED`. Si la copia local de la tarjeta aún no llegó, se omite.
+          example: '**** 4821'
+        mainAccountId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Solo si `LINKED`. Cuenta principal de la tarjeta según la copia local (con su saldo real en `account-service`).
+
+    FailureReason:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          example: MONTHLY_LIMIT_EXCEEDED
+        message:
+          type: string
+
+    WalletPayment:
+      type: object
+      description: Un pago visto desde el monedero de la ruta (`walletId`). No expone ningún dato de la otra parte salvo su celular enmascarado.
+      required: [id, walletId, direction, counterpartMaskedPhone, amount, status, requestedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        walletId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: El monedero desde el que se ve el pago.
+        direction:
+          $ref: '#/components/schemas/PaymentDirection'
+        operationId:
+          allOf:
+            - $ref: '#/components/schemas/RequestOperationId'
+          description: Solo en los pagos enviados (`SENT`).
+        counterpartMaskedPhone:
+          $ref: '#/components/schemas/MaskedPhone'
+        amount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        description:
+          type: string
+        status:
+          $ref: '#/components/schemas/WalletPaymentStatus'
+        failureReason:
+          allOf:
+            - $ref: '#/components/schemas/FailureReason'
+          description: Solo en `FAILED`, `COMPENSATING`, `COMPENSATED` y `COMPENSATION_FAILED`. Es el motivo del **rechazo original**.
+        compensationFailure:
+          allOf:
+            - $ref: '#/components/schemas/FailureReason'
+          description: Solo en `COMPENSATION_FAILED`. Por qué no se pudo devolver (`NO_RESPONSE` si se agotaron los intentos sin respuesta).
+        requestedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          description: Cuándo llegó a un estado terminal. Se omite mientras está en curso.
+
+    WalletPaymentPage:
+      allOf:
+        - $ref: '../common/common-schemas.yaml#/components/schemas/PageMeta'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/WalletPayment'
+
+    RecoveryResult:
+      type: object
+      required: [ranAt, olderThanMinutes, inProgressFound, resumed, exhausted, compensationFailed]
+      properties:
+        ranAt:
+          type: string
+          format: date-time
+        olderThanMinutes:
+          type: integer
+        inProgressFound:
+          type: integer
+          description: Pagos `STARTED`, `SOURCE_DEBITED` o `COMPENSATING` con la antigüedad pedida.
+        resumed:
+          type: integer
+          description: A los que se les repitió el paso local o se les reenvió el comando remoto.
+        exhausted:
+          type: integer
+          description: Los que ya llegaron al máximo de reintentos y no se reintentaron.
+        compensationFailed:
+          type: integer
+          description: Los que en esta corrida pasaron a `COMPENSATION_FAILED` por agotar los intentos de la devolución.
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

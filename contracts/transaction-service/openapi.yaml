@@ -1,0 +1,859 @@
+openapi: 3.0.3
+info:
+  title: transaction-service
+  version: 1.0.0
+  description: |
+    Historial de movimientos de todos los productos (cuentas, créditos y tarjetas de crédito), depósitos, retiros y
+    transferencias entre cuentas. **Orquesta la saga de transferencias** (retirar del origen, depositar en el destino y,
+    si el depósito es rechazado, revertir el retiro).
+
+    - **No calcula saldos ni reglas de límites o comisiones**: pide a `account-service` aplicar cada movimiento y guarda el resultado.
+    - **Idempotencia:** todas las operaciones que mueven dinero llevan un `operationId` generado por el cliente.
+      Repetir la petición devuelve el resultado original sin duplicar el efecto. Reusarlo con otros datos responde 409 `OPERATION_ID_REUSED`.
+    - **Respuesta perdida no es rechazo:** si la cuenta no responde a tiempo, la operación queda pendiente y se responde **202**.
+      El cliente (o el proceso de recuperación) reintenta con el **mismo** `operationId`.
+    - El historial es **inmutable**: solo se edita la `description` y solo se descartan (baja lógica) los movimientos `FAILED`.
+    - `POST /transactions/records` y `POST /transaction-recovery-runs` no son de uso del cliente final (ver `x-internal`).
+
+    Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
+servers:
+  - url: /api/v1
+tags:
+  - name: Deposits and withdrawals
+  - name: Transfers
+  - name: Transactions
+  - name: Internal
+    description: Solo para servicios del banco o para el administrador. `records` no se expone por el Gateway.
+security:
+  - bearerAuth: []
+
+paths:
+
+  /deposits:
+    post:
+      tags: [Deposits and withdrawals]
+      operationId: registerDeposit
+      summary: Depositar en una cuenta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo deposita en sus propias cuentas (403 si la cuenta es de otro cliente).
+      description: |
+        Crea el movimiento `DEPOSIT` en estado `PENDING`, pide a `account-service` aplicarlo y guarda el resultado.
+        Si la cuenta cobra comisión, además se guarda un movimiento `FEE` enlazado (`feeTransaction`).
+
+        Respuestas:
+        - **201** aplicado. **200** si es una repetición de una operación ya aplicada.
+        - **202** sin respuesta definitiva de la cuenta a tiempo (P1/P2: la llamada REST vence a los 2 s; P3: la espera `payment.await-timeout` vence a los 1,5 s): el movimiento sigue `PENDING`. Repetir con el mismo `operationId`.
+        - **422** rechazado por la cuenta (el movimiento queda `FAILED`). Repetir devuelve el mismo 422.
+        - 404 `ACCOUNT_NOT_FOUND`, 409 `OPERATION_ID_REUSED`, 503 si no se pudo consultar la cuenta y no se creó nada.
+
+        Códigos 422 (los decide `account-service`): `ACCOUNT_INACTIVE`, `MONTHLY_LIMIT_EXCEEDED`, `NOT_ALLOWED_DAY`, `INSUFFICIENT_FUNDS` (un depósito menor que la comisión), `INVALID_DATE`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MovementRequest'
+            examples:
+              deposito:
+                value:
+                  operationId: 6d1f3b52-9c4e-4a7d-8e21-0b5a7c9d1e33
+                  accountId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                  amount: 250.00
+                  description: Depósito en ventanilla
+      responses:
+        '200':
+          $ref: '#/components/responses/MovementOk'
+        '201':
+          $ref: '#/components/responses/MovementCreated'
+        '202':
+          $ref: '#/components/responses/MovementAccepted'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/MovementRejected'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+
+  /withdrawals:
+    post:
+      tags: [Deposits and withdrawals]
+      operationId: registerWithdrawal
+      summary: Retirar de una cuenta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo retira de sus propias cuentas (403 si la cuenta es de otro cliente).
+      description: |
+        Igual que el depósito, con un movimiento `WITHDRAWAL`. El retiro más la comisión no puede superar el saldo
+        (422 `INSUFFICIENT_FUNDS`). Mismas respuestas (201, 200, 202, 422) y mismos códigos que `POST /deposits`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MovementRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/MovementOk'
+        '201':
+          $ref: '#/components/responses/MovementCreated'
+        '202':
+          $ref: '#/components/responses/MovementAccepted'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/MovementRejected'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+
+  /transfers:
+    post:
+      tags: [Transfers]
+      operationId: startTransfer
+      summary: Transferir entre cuentas
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo transfiere **desde** sus propias cuentas; el destino puede ser de un tercero del mismo banco. Con seguridad desactivada esta regla no se aplica.
+      description: |
+        Saga: 1) retira del origen (`<op>-OUT`), 2) deposita en el destino (`<op>-IN`), 3) si el depósito es rechazado, **revierte** el retiro.
+        Cada cuenta aplica sus propias reglas y comisiones a su pata. `kind` se calcula: `OWN` si ambas cuentas son del mismo cliente, `THIRD_PARTY` si no.
+
+        Validaciones previas (no crean la transferencia): 400 formato, 404 `ACCOUNT_NOT_FOUND` (origen o destino),
+        403 origen ajeno, 422 `SAME_ACCOUNT` y 422 `ACCOUNT_INACTIVE` (origen o destino).
+
+        Respuestas según el estado de la saga:
+        - **201** `COMPLETED`. **200** si es una repetición y ya estaba `COMPLETED`.
+        - **202** sigue en proceso (`STARTED`, `SOURCE_DEBITED`, `COMPENSATING`) o terminó en `COMPENSATION_FAILED` (revisión manual). Consultar `GET /transfers/{id}`.
+        - **422** terminó sin mover dinero (`FAILED`, retiro rechazado) o el depósito fue rechazado y el retiro se devolvió (`COMPENSATED`). El cuerpo trae el motivo, `transferId` y `transferStatus`.
+        - Repetir con el mismo `operationId` devuelve el estado actual, nunca crea otra. Con otros datos: 409 `OPERATION_ID_REUSED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartTransferRequest'
+            examples:
+              transferencia:
+                value:
+                  operationId: b7f0c2a4-19d2-4c0a-8d6e-3a9c1f7e5b20
+                  sourceAccountId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                  targetAccountId: 7e2a1c9b-4d3f-4b6a-9e8d-2c1b0a9f8e7d
+                  amount: 150.00
+                  description: Pago de alquiler
+      responses:
+        '200':
+          description: Repetición de una transferencia que ya estaba completada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '201':
+          description: Transferencia completada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '202':
+          description: Transferencia en proceso o en revisión manual (`COMPENSATION_FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/TransferRejected'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Transfers]
+      operationId: listTransfers
+      summary: Listar transferencias
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Sin paginación: devuelve como máximo las 200 más recientes. Se consulta por `operationId` (una sola), o por `accountId`
+        (origen o destino), o por `status`; si se envían varios, el primero de esa lista se consulta en la base y los demás
+        se aplican en memoria. Sin filtros, las 200 más recientes. Sirve, por ejemplo, para listar las `COMPENSATION_FAILED`.
+      parameters:
+        - name: operationId
+          in: query
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        - name: accountId
+          in: query
+          description: Cuenta de origen o de destino.
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/TransferStatus'
+      responses:
+        '200':
+          description: Lista de transferencias (puede ser vacía).
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 200
+                items:
+                  $ref: '#/components/schemas/Transfer'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /transfers/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    get:
+      tags: [Transfers]
+      operationId: getTransfer
+      summary: Consultar el estado de una transferencia
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve transferencias cuya cuenta de origen es suya.
+      responses:
+        '200':
+          description: Transferencia encontrada (en cualquier estado).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /products/{productId}/transactions:
+    parameters:
+      - name: productId
+        in: path
+        required: true
+        description: Id de la cuenta, del crédito o de la tarjeta de crédito.
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    get:
+      tags: [Transactions]
+      operationId: listProductTransactions
+      summary: Historial de movimientos de un producto
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve productos suyos (403 si los movimientos son de otro cliente). Un producto sin movimientos devuelve una página vacía.
+      description: |
+        Más recientes primero. Sin `status`, **no** incluye los `DISCARDED`. Sin `from`/`to`, todo el historial.
+        `from` y `to` son fechas inclusivas en la zona horaria del banco. `from` no puede ser posterior a `to` (400 `INVALID_DATE_RANGE`).
+        Con `size=10` devuelve los últimos 10 movimientos.
+      parameters:
+        - $ref: '../common/common-schemas.yaml#/components/parameters/FromParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/ToParam'
+        - $ref: '#/components/parameters/TypeFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/PageParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/SizeParam'
+      responses:
+        '200':
+          $ref: '#/components/responses/TransactionPageOk'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /transactions:
+    get:
+      tags: [Transactions]
+      operationId: listTransactions
+      summary: Consulta administrativa de movimientos por cliente
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Movimientos de **todos** los productos de un cliente. `customerId` es obligatorio (no hay consulta de todo el banco).
+        Mismas reglas de orden, fechas, filtros y paginación que el historial de un producto.
+      parameters:
+        - name: customerId
+          in: query
+          required: true
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/FromParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/ToParam'
+        - $ref: '#/components/parameters/TypeFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/PageParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/SizeParam'
+      responses:
+        '200':
+          $ref: '#/components/responses/TransactionPageOk'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /transactions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    get:
+      tags: [Transactions]
+      operationId: getTransaction
+      summary: Obtener un movimiento
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve movimientos cuyo `customerId` es el del token.
+      responses:
+        '200':
+          description: Movimiento encontrado (también si está `DISCARDED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Transactions]
+      operationId: updateTransactionDescription
+      summary: Editar la descripción de un movimiento
+      x-roles: [ADMIN]
+      description: |
+        Es lo único editable de un movimiento. No cambia monto, tipo, producto ni estado.
+        422 `TRANSACTION_DISCARDED` si el movimiento fue descartado.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDescriptionRequest'
+      responses:
+        '200':
+          description: Descripción actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Transactions]
+      operationId: discardTransaction
+      summary: Descartar un movimiento fallido (baja lógica)
+      x-roles: [ADMIN]
+      description: |
+        Solo movimientos `FAILED` (pasan a `DISCARDED` y dejan de salir en los listados por defecto).
+        Otro estado: 422 `NOT_DISCARDABLE`. Es idempotente: repetir sobre un `DISCARDED` también responde 204.
+      responses:
+        '204':
+          description: Movimiento descartado.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /transactions/records:
+    post:
+      tags: [Internal]
+      operationId: recordExternalMovement
+      summary: "Interno: registrar un movimiento de crédito o tarjeta"
+      x-internal: true
+      x-roles: [ADMIN]
+      description: |
+        Lo usa `credit-service` en P1/P2 (en P3 lo reemplazan los eventos `credit.payment.registered` y `credit.card.charge.registered`).
+        El efecto ya ocurrió en `credit-service`: aquí **se registra, no se valida**. El movimiento nace `COMPLETED`.
+        Idempotente por `operationId`: un duplicado devuelve el registro original (200); con otros datos, 409 `OPERATION_ID_REUSED`.
+        422 `INVALID_TYPE_FOR_PRODUCT` si el tipo no corresponde al producto (`CREDIT` → `CREDIT_PAYMENT`; `CREDIT_CARD` → `CARD_PAYMENT` o `CARD_CHARGE`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordExternalMovementRequest'
+            examples:
+              pagoDeCredito:
+                value:
+                  operationId: 0c8e5f11-3a7b-4d2c-9b1e-6f4a2d8c7e90
+                  productType: CREDIT
+                  productId: 5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e
+                  customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                  type: CREDIT_PAYMENT
+                  amount: 300.00
+                  resultingBalance: 1200.00
+                  payerCustomerId: c0a1b2c3-d4e5-4f60-8a9b-0c1d2e3f4a5b
+                  occurredAt: '2026-09-24T15:24:00Z'
+      responses:
+        '200':
+          description: 'Duplicado: se devuelve el movimiento ya registrado.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '201':
+          description: Movimiento registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /transaction-recovery-runs:
+    post:
+      tags: [Internal]
+      operationId: runTransactionRecovery
+      summary: Ejecutar ahora la recuperación de operaciones pendientes
+      x-roles: [ADMIN]
+      description: |
+        Hace lo mismo que el proceso programado: retoma los movimientos `PENDING` y las transferencias `STARTED`, `SOURCE_DEBITED` o
+        `COMPENSATING` sin avanzar hace más de N minutos, reintentando con el **mismo** `operationId`. Nunca compensa por un tiempo agotado.
+        Para la demo, `olderThanMinutes=0` las toma todas.
+      parameters:
+        - name: olderThanMinutes
+          in: query
+          required: false
+          description: Antigüedad mínima en minutos. Por defecto, el valor configurado.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1440
+      responses:
+        '200':
+          description: Resultado de la corrida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryResult'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+components:
+
+  parameters:
+    TypeFilter:
+      name: type
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/TransactionType'
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Sin este filtro no se incluyen los `DISCARDED`.
+      schema:
+        $ref: '#/components/schemas/TransactionStatus'
+
+  responses:
+    MovementOk:
+      description: Repetición de un movimiento ya aplicado (mismo resultado).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MovementResponse'
+    MovementCreated:
+      description: Movimiento aplicado.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MovementResponse'
+    MovementAccepted:
+      description: Sin respuesta definitiva de la cuenta; el movimiento sigue `PENDING`. Repetir con el mismo `operationId`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MovementResponse'
+    MovementRejected:
+      description: La cuenta rechazó el movimiento (queda `FAILED`). El `code` es el motivo.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '../common/common-schemas.yaml#/components/schemas/ErrorResponse'
+              - type: object
+                properties:
+                  transactionId:
+                    $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    TransferRejected:
+      description: |
+        La transferencia no se completó. `transferStatus` es `FAILED` (retiro rechazado, no se movió dinero) o `COMPENSATED`
+        (depósito rechazado y retiro devuelto). El `code` es el motivo de la cuenta que rechazó.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '../common/common-schemas.yaml#/components/schemas/ErrorResponse'
+              - type: object
+                required: [transferId, transferStatus]
+                properties:
+                  transferId:
+                    $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+                  transferStatus:
+                    $ref: '#/components/schemas/TransferStatus'
+    TransactionPageOk:
+      description: Página de movimientos, más recientes primero.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/TransactionPage'
+
+  schemas:
+
+    RequestOperationId:
+      type: string
+      description: |
+        Identificador de idempotencia del cliente (UUID recomendado). Máximo **56** caracteres: el servicio le agrega sufijos
+        (`-OUT`, `-IN`, `-REV`, `-FEE`, `-OUT-FEE`, `-IN-FEE`, hasta 8 caracteres) y el resultado debe caber en los 64 del `OperationId` común.
+      minLength: 8
+      maxLength: 56
+      example: 6d1f3b52-9c4e-4a7d-8e21-0b5a7c9d1e33
+
+    ProductType:
+      type: string
+      enum: [ACCOUNT, CREDIT, CREDIT_CARD]
+
+    TransactionType:
+      type: string
+      enum: [DEPOSIT, WITHDRAWAL, TRANSFER_OUT, TRANSFER_IN, FEE, CREDIT_PAYMENT, CARD_PAYMENT, CARD_CHARGE, DEBIT_PAYMENT, YANKI_PAYMENT_OUT, YANKI_PAYMENT_IN]
+      description: |
+        `DEBIT_PAYMENT` y `YANKI_PAYMENT_*` los crea el servicio solo en P3, a pedido de `debit-service` y `yanki-service`.
+
+    TransactionStatus:
+      type: string
+      enum: [PENDING, COMPLETED, FAILED, REVERSED, DISCARDED]
+
+    TransferKind:
+      type: string
+      enum: [OWN, THIRD_PARTY]
+
+    TransferStatus:
+      type: string
+      enum: [STARTED, SOURCE_DEBITED, COMPLETED, FAILED, COMPENSATING, COMPENSATED, COMPENSATION_FAILED]
+      description: 'Terminales: `COMPLETED`, `FAILED`, `COMPENSATED`, `COMPENSATION_FAILED` (este último requiere revisión manual).'
+
+    FailureReason:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          example: INSUFFICIENT_FUNDS
+        message:
+          type: string
+
+    MovementRequest:
+      type: object
+      required: [operationId, accountId, amount]
+      properties:
+        operationId:
+          $ref: '#/components/schemas/RequestOperationId'
+        accountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        amount:
+          type: number
+          minimum: 0.01
+          multipleOf: 0.01
+          description: Mayor que 0, hasta 2 decimales, en soles.
+          example: 250.00
+        description:
+          type: string
+          maxLength: 200
+
+    StartTransferRequest:
+      type: object
+      required: [operationId, sourceAccountId, targetAccountId, amount]
+      properties:
+        operationId:
+          $ref: '#/components/schemas/RequestOperationId'
+        sourceAccountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        targetAccountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        amount:
+          type: number
+          minimum: 0.01
+          multipleOf: 0.01
+          example: 150.00
+        description:
+          type: string
+          maxLength: 200
+
+    UpdateDescriptionRequest:
+      type: object
+      required: [description]
+      properties:
+        description:
+          type: string
+          maxLength: 200
+
+    RecordExternalMovementRequest:
+      type: object
+      required: [operationId, productType, productId, customerId, type, amount, resultingBalance, occurredAt]
+      properties:
+        operationId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        productType:
+          type: string
+          enum: [CREDIT, CREDIT_CARD]
+        productId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        customerId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Dueño del producto.
+        type:
+          type: string
+          enum: [CREDIT_PAYMENT, CARD_PAYMENT, CARD_CHARGE]
+        amount:
+          type: number
+          minimum: 0.01
+          multipleOf: 0.01
+        resultingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo pendiente del crédito o monto usado de la tarjeta tras la operación.
+        payerCustomerId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Solo si pagó un tercero.
+        description:
+          type: string
+          maxLength: 200
+        occurredAt:
+          type: string
+          format: date-time
+
+    Reversal:
+      type: object
+      description: Reversa pedida sobre este movimiento (compensación de una transferencia o devolución de un pago Yanki).
+      required: [operationId, outcome]
+      properties:
+        operationId:
+          type: string
+          description: '`<op>-REV`.'
+          example: b7f0c2a4-19d2-4c0a-8d6e-3a9c1f7e5b20-REV
+        outcome:
+          type: string
+          enum: [PENDING, REVERSED, FAILED]
+        reasonCode:
+          type: string
+          description: Solo si `outcome = FAILED`.
+
+    Transaction:
+      type: object
+      description: Un movimiento sobre **un solo producto**. Es el registro del historial.
+      required: [id, operationId, productId, productType, customerId, type, amount, status, occurredAt, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        operationId:
+          type: string
+          description: Único. Para una pata de transferencia, `<op>-OUT` o `<op>-IN`; para una comisión, `<op>-FEE`, `<op>-OUT-FEE` o `<op>-IN-FEE`.
+          example: 6d1f3b52-9c4e-4a7d-8e21-0b5a7c9d1e33
+        productId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        productType:
+          $ref: '#/components/schemas/ProductType'
+        customerId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Dueño del producto.
+        type:
+          $ref: '#/components/schemas/TransactionType'
+        amount:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Siempre positivo; el `type` indica el sentido. En un retiro o depósito no incluye la comisión (va en su movimiento `FEE`).
+        resultingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo de la cuenta, saldo pendiente del crédito o monto usado de la tarjeta tras el movimiento. Se omite mientras está `PENDING` o `FAILED`.
+        status:
+          $ref: '#/components/schemas/TransactionStatus'
+        failureReason:
+          allOf:
+            - $ref: '#/components/schemas/FailureReason'
+          description: Solo si `FAILED`.
+        transferId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Si es pata (o comisión de una pata) de una transferencia.
+        parentTransactionId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: En las comisiones `FEE`, el movimiento que las originó.
+        payerCustomerId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Solo en pagos de terceros.
+        description:
+          type: string
+          maxLength: 200
+        reversal:
+          $ref: '#/components/schemas/Reversal'
+        occurredAt:
+          type: string
+          format: date-time
+          description: Cuando se aceptó la operación. **No cambia** aunque el movimiento termine después; es la fecha por la que se ordena y filtra el historial. Una comisión `FEE` tiene el mismo que su movimiento padre.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    MovementResponse:
+      type: object
+      required: [transaction]
+      properties:
+        transaction:
+          $ref: '#/components/schemas/Transaction'
+        feeTransaction:
+          allOf:
+            - $ref: '#/components/schemas/Transaction'
+          description: Movimiento `FEE` enlazado, solo si la cuenta cobró comisión.
+
+    Transfer:
+      type: object
+      description: Estado de una transferencia (la máquina de estados de la saga).
+      required: [id, operationId, sourceAccountId, targetAccountId, amount, kind, status, compensationAttempts, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        operationId:
+          type: string
+          example: b7f0c2a4-19d2-4c0a-8d6e-3a9c1f7e5b20
+        sourceAccountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        targetAccountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        amount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        kind:
+          $ref: '#/components/schemas/TransferKind'
+        status:
+          $ref: '#/components/schemas/TransferStatus'
+        failureReason:
+          allOf:
+            - $ref: '#/components/schemas/FailureReason'
+          description: Solo en `FAILED`, `COMPENSATED` y `COMPENSATION_FAILED`.
+        debitTransactionId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: El movimiento `TRANSFER_OUT` (aparece al crearse el retiro).
+        creditTransactionId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: El movimiento `TRANSFER_IN` (aparece al pedirse el depósito).
+        compensationAttempts:
+          type: integer
+          minimum: 0
+          description: Intentos de reversa realizados.
+        description:
+          type: string
+        requestedBy:
+          type: string
+          description: Usuario que la inició (`sub` del token). Con seguridad desactivada, `anonymous`.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    TransactionPage:
+      allOf:
+        - $ref: '../common/common-schemas.yaml#/components/schemas/PageMeta'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/Transaction'
+
+    RecoveryResult:
+      type: object
+      required: [ranAt, olderThanMinutes, pendingTransactionsFound, transactionsResolved, transfersFound, transfersResolved, stillInProgress]
+      properties:
+        ranAt:
+          type: string
+          format: date-time
+        olderThanMinutes:
+          type: integer
+        pendingTransactionsFound:
+          type: integer
+          description: Movimientos `PENDING` encontrados (los que no pertenecen a una transferencia).
+        transactionsResolved:
+          type: integer
+          description: Los que llegaron a `COMPLETED` o `FAILED`.
+        transfersFound:
+          type: integer
+        transfersResolved:
+          type: integer
+          description: Las que llegaron a un estado terminal.
+        stillInProgress:
+          type: integer
+          description: Los que siguen sin respuesta y se reintentan en la próxima corrida.
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

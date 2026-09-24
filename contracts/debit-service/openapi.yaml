@@ -1,0 +1,713 @@
+openapi: 3.0.3
+info:
+  title: debit-service
+  version: 1.0.0
+  description: |
+    Tarjetas de débito y pagos hechos con ellas. **Servicio de P3: no llama por REST a ningún otro servicio**; valida con copias locales
+    (clientes, cuentas, deuda vencida) alimentadas por Kafka y pide el retiro a `transaction-service` por Kafka.
+
+    - **Tarjeta.** Se asocia a **una o más cuentas del mismo cliente** (`SAVINGS` o `CHECKING`, `ACTIVE`) y siempre tiene una **cuenta principal** entre ellas.
+      Si no se indica la principal, es la primera cuenta. Vence a los 5 años de la emisión. Sin límite de tarjetas por cliente. Número ficticio de 16 dígitos: **solo se expone enmascarado**.
+    - **Pago.** El cargo va a la cuenta principal o a otra asociada si se indica. Es una saga de **un solo paso** que orquesta `debit-service`: crea el pago `PENDING`, pide el retiro
+      y termina en `COMPLETED` o `FAILED`. No hay compensación (no hay pasos posteriores) ni reembolsos.
+      Saldo, límite mensual y comisión los decide `account-service`; aquí solo se conocen en el resultado.
+    - **Espera de 1,5 s.** El `POST` de un pago espera hasta 1,5 s (`payment.await-timeout`) el resultado. Si llega: **201** (completado) o **422** (rechazado, con el motivo de la cuenta).
+      Si no llega: **202** con el pago `PENDING`; el cliente consulta el pago o repite con el **mismo `operationId`**. Nunca se crea un segundo pago con el mismo `operationId`.
+    - **Idempotencia.** El `operationId` del cliente se usa **tal cual** para el pago, el movimiento del historial y el retiro de la cuenta. Mismo `operationId` con otra tarjeta, monto o cuenta: 409 `OPERATION_ID_REUSED`.
+    - **Deuda vencida (RF-60)** bloquea **emitir** tarjetas, **no** pagar con las que ya existen.
+    - **Cierre.** Baja lógica (`CLOSED`). Si se cierra la única cuenta asociada, la tarjeta se cierra sola (evento de cuenta).
+    - Las copias locales son eventualmente consistentes: una cuenta o cliente recién creados pueden responder 422 `ACCOUNT_NOT_FOUND` o `CUSTOMER_NOT_FOUND` unos instantes; se repite.
+
+    Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
+servers:
+  - url: /api/v1
+tags:
+  - name: Debit cards
+  - name: Card accounts
+  - name: Debit payments
+  - name: Internal
+    description: Solo para el administrador.
+security:
+  - bearerAuth: []
+
+paths:
+
+  /debit-cards:
+    post:
+      tags: [Debit cards]
+      operationId: issueDebitCard
+      summary: Emitir una tarjeta de débito
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo emite tarjetas para su propio `customerId` (403 si es otro).
+      description: |
+        Validaciones, en este orden: el cliente existe (422 `CUSTOMER_NOT_FOUND`) y está `ACTIVE` (422 `CUSTOMER_INACTIVE`); no tiene **deuda vencida** (422 `OVERDUE_DEBT`);
+        cada cuenta existe (422 `ACCOUNT_NOT_FOUND`) y es elegible: del **mismo cliente**, `ACTIVE`, `SAVINGS` o `CHECKING` (422 `ACCOUNT_NOT_ELIGIBLE`);
+        la principal, si se indica, está entre las asociadas (422 `MAIN_ACCOUNT_REQUIRED`).
+        Las cuentas duplicadas en la lista responden 400.
+
+        Solo cuentas de las que el cliente es el titular principal (`customerId` de la cuenta); las cuentas mancomunadas donde solo es cotitular no se pueden asociar.
+        Nace `ACTIVE`; el vencimiento es el mes de la emisión más 5 años. Publica `debit.card.created`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueDebitCardRequest'
+            example:
+              customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+              accountIds: [a1000000-0000-4000-8000-000000000001, a1000000-0000-4000-8000-000000000002]
+              mainAccountId: a1000000-0000-4000-8000-000000000001
+      responses:
+        '201':
+          description: Tarjeta emitida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    get:
+      tags: [Debit cards]
+      operationId: listDebitCards
+      summary: Listar tarjetas
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve las suyas; `customerId` se toma del token (403 si pide el de otro).
+      description: Sin paginación. Filtros opcionales combinados con Y. Orden `createdAt` descendente y `id`.
+      parameters:
+        - name: customerId
+          in: query
+          required: false
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/DebitCardStatus'
+      responses:
+        '200':
+          description: Tarjetas que cumplen los filtros (lista vacía si ninguna).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DebitCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /debit-cards/{id}:
+    parameters:
+      - $ref: '#/components/parameters/CardIdPath'
+    get:
+      tags: [Debit cards]
+      operationId: getDebitCard
+      summary: Obtener una tarjeta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve las suyas (403 si es de otro).
+      responses:
+        '200':
+          description: Tarjeta (también si está cerrada o vencida).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitCard'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Card accounts]
+      operationId: replaceCardAccounts
+      summary: Reemplazar las cuentas asociadas y la principal
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo modifica las suyas.
+      description: |
+        Reemplaza **todo** el conjunto de cuentas. Cada cuenta debe ser elegible (mismas reglas que al emitir). Si falta `mainAccountId`, la principal es la primera cuenta de la lista.
+        Una tarjeta `CLOSED` o vencida no admite cambios (422 `CARD_NOT_USABLE`). Publica `debit.card.updated`.
+        409 `CONCURRENT_MODIFICATION` si se agotan los reintentos por conflicto de versión.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceAccountsRequest'
+      responses:
+        '200':
+          description: Tarjeta actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Debit cards]
+      operationId: closeDebitCard
+      summary: Cerrar una tarjeta (baja lógica)
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo cierra las suyas.
+      description: |
+        Pasa la tarjeta a `CLOSED` y publica `debit.card.closed`. Repetir el cierre responde 204 sin publicar de nuevo.
+        422 `CARD_HAS_PENDING_PAYMENTS` si tiene pagos `PENDING`. Los pagos ya hechos no se tocan.
+      responses:
+        '204':
+          description: Tarjeta cerrada.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /debit-cards/{id}/accounts:
+    parameters:
+      - $ref: '#/components/parameters/CardIdPath'
+    post:
+      tags: [Card accounts]
+      operationId: linkAccount
+      summary: Asociar una cuenta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo modifica sus tarjetas.
+      description: |
+        La cuenta debe ser elegible (del mismo cliente, `ACTIVE`, `SAVINGS` o `CHECKING`) y no estar ya asociada. No cambia la principal.
+        Errores 422: `CARD_NOT_USABLE`, `ACCOUNT_NOT_FOUND`, `ACCOUNT_NOT_ELIGIBLE`, `ACCOUNT_ALREADY_LINKED`, `MAX_ACCOUNTS_REACHED` (ya tiene 10). Publica `debit.card.updated`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountRefRequest'
+      responses:
+        '200':
+          description: Tarjeta actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /debit-cards/{id}/accounts/{accountId}:
+    parameters:
+      - $ref: '#/components/parameters/CardIdPath'
+      - name: accountId
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    delete:
+      tags: [Card accounts]
+      operationId: unlinkAccount
+      summary: Desasociar una cuenta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo modifica sus tarjetas.
+      description: |
+        No se puede quitar la cuenta principal (cambiarla primero con `PUT .../main-account`) ni la única cuenta.
+        404 `ACCOUNT_NOT_LINKED` si la cuenta no está asociada. Errores 422: `CARD_NOT_USABLE`, `LAST_ACCOUNT` (es la única; se evalúa primero), `MAIN_ACCOUNT_REQUIRED` (es la principal y hay otras).
+        Publica `debit.card.updated`.
+      responses:
+        '200':
+          description: Tarjeta actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitCard'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /debit-cards/{id}/main-account:
+    parameters:
+      - $ref: '#/components/parameters/CardIdPath'
+    put:
+      tags: [Card accounts]
+      operationId: changeMainAccount
+      summary: Cambiar la cuenta principal
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo modifica sus tarjetas.
+      description: |
+        La nueva principal debe estar entre las asociadas (422 `MAIN_ACCOUNT_REQUIRED` si no). Si ya es la principal, responde 200 sin cambios ni evento.
+        422 `CARD_NOT_USABLE` si la tarjeta está cerrada o vencida. Publica `debit.card.updated`. Los pagos ya `PENDING` conservan su cuenta de cargo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountRefRequest'
+      responses:
+        '200':
+          description: Tarjeta actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /debit-cards/{id}/payments:
+    parameters:
+      - $ref: '#/components/parameters/CardIdPath'
+    post:
+      tags: [Debit payments]
+      operationId: payWithDebitCard
+      summary: Pagar con la tarjeta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo paga con sus tarjetas (403 si es de otro).
+      description: |
+        Orden de las comprobaciones: (1) la tarjeta existe y es del usuario (404, 403); (2) **idempotencia**: si el `operationId` ya tiene un pago, se compara (tarjeta, monto y `accountId` pedido; si difieren,
+        409 `OPERATION_ID_REUSED`) y se devuelve el estado actual, aunque la tarjeta ya se haya cerrado; (3) la tarjeta está `ACTIVE` y no vencida (422 `CARD_NOT_USABLE`);
+        (4) el cliente sigue `ACTIVE` (422 `CUSTOMER_INACTIVE`); (5) la cuenta de cargo (la indicada o la principal) está asociada a la tarjeta (422 `ACCOUNT_NOT_ELIGIBLE`).
+        Con (3) a (5) fallando **no se crea ningún pago**. La deuda vencida no impide pagar.
+
+        Después se guarda el pago `PENDING`, se pide el retiro y se espera hasta 1,5 s el resultado.
+
+        | Situación | Respuesta |
+        |---|---|
+        | Retiro aplicado a tiempo | 201, pago `COMPLETED` (con `resultingBalance` y, si hubo, `fee`) |
+        | Sin resultado en 1,5 s | 202, pago `PENDING`. Consultar el pago o repetir con el mismo `operationId` |
+        | Rechazo de la cuenta (`INSUFFICIENT_FUNDS`, `MONTHLY_LIMIT_EXCEEDED`, `ACCOUNT_INACTIVE`, `ACCOUNT_NOT_FOUND`, `INVALID_AMOUNT`, `INVALID_DATE`, `OPERATION_ID_REUSED`, ...) | 422 con el `code` de la cuenta y el `paymentId`; pago `FAILED` |
+        | Repetición | `COMPLETED` → 200; `FAILED` → 422 con el mismo código; `PENDING` → 202 |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayRequest'
+            example:
+              operationId: 3c1e9b52-7d4a-4f0e-8b1a-6c2d9e5f7a10
+              amount: 45.90
+              description: Compra en bodega
+      responses:
+        '200':
+          description: Repetición de un pago que ya estaba `COMPLETED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitPayment'
+        '201':
+          description: Pago aplicado dentro de los 1,5 s.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitPayment'
+              example:
+                id: d2b8c1a0-5e4f-4a3b-9c7d-1e0f2a3b4c5d
+                operationId: 3c1e9b52-7d4a-4f0e-8b1a-6c2d9e5f7a10
+                cardId: c9a8b7c6-d5e4-4f3a-8b2c-1d0e9f8a7b6c
+                customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                accountId: a1000000-0000-4000-8000-000000000001
+                amount: 45.90
+                description: Compra en bodega
+                status: COMPLETED
+                transactionId: 9e8d7c6b-5a49-4382-a716-05f4e3d2c1b0
+                resultingBalance: 954.10
+                requestedAt: '2026-09-24T15:24:00Z'
+                completedAt: '2026-09-24T15:24:01Z'
+        '202':
+          description: Sin resultado en 1,5 s; el pago sigue `PENDING`. Repetir con el mismo `operationId` o consultar el pago.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitPayment'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/PaymentRejected'
+    get:
+      tags: [Debit payments]
+      operationId: listCardPayments
+      summary: Pagos de una tarjeta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve los de sus tarjetas.
+      description: |
+        Más recientes primero (`requestedAt` descendente, empate por `id`). Fechas inclusivas, en la zona horaria del banco; sin `from`/`to` no hay límite.
+        Los "últimos 10 movimientos" de una tarjeta de débito son `?status=COMPLETED&size=10`.
+        `operationId` permite encontrar un pago rechazado tras el 422 (devuelve 0 o 1 pago).
+        400 `INVALID_DATE_RANGE` si `from` es posterior a `to`.
+      parameters:
+        - $ref: '../common/common-schemas.yaml#/components/parameters/FromParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/ToParam'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/DebitPaymentStatus'
+        - name: operationId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/RequestOperationId'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/PageParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: Página de pagos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitPaymentPage'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /debit-cards/{id}/payments/{paymentId}:
+    parameters:
+      - $ref: '#/components/parameters/CardIdPath'
+      - name: paymentId
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    get:
+      tags: [Debit payments]
+      operationId: getCardPayment
+      summary: Estado de un pago
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve los de sus tarjetas.
+      description: Se usa tras un 202 para saber si el pago terminó. 404 `DEBIT_PAYMENT_NOT_FOUND` si el pago no existe o es de otra tarjeta.
+      responses:
+        '200':
+          description: Pago.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitPayment'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /debit-payment-recovery-runs:
+    post:
+      tags: [Internal]
+      operationId: runDebitPaymentRecovery
+      summary: Ejecutar ahora la recuperación de pagos pendientes
+      x-roles: [ADMIN]
+      description: |
+        Hace lo mismo que el proceso programado: reenvía el pedido de retiro (`debit.payment.requested`) de los pagos `PENDING` con más de N minutos, con el **mismo** `operationId`.
+        Nunca crea un pago nuevo ni cambia el estado por sí mismo: el estado lo cambia el consumidor del resultado. Un pago que ya se reenvió el máximo de veces
+        (`debit.recovery.max-attempts`) deja de reenviarse y se cuenta en `exhausted` (queda `PENDING` para revisión manual).
+        Para la demo, `olderThanMinutes=0` los toma todos.
+      parameters:
+        - name: olderThanMinutes
+          in: query
+          required: false
+          description: Antigüedad mínima en minutos. Por defecto, el valor configurado.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1440
+      responses:
+        '200':
+          description: Resultado de la corrida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryResult'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+components:
+
+  parameters:
+    CardIdPath:
+      name: id
+      in: path
+      required: true
+      description: Identificador de la tarjeta de débito.
+      schema:
+        $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+  responses:
+    PaymentRejected:
+      description: |
+        No se pudo pagar. Con `paymentId`: la cuenta rechazó el retiro y el pago quedó `FAILED` (el `code` es el motivo de la cuenta).
+        Sin `paymentId`: se rechazó **antes** de crear el pago (`CARD_NOT_USABLE`, `CUSTOMER_INACTIVE`, `ACCOUNT_NOT_ELIGIBLE`).
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '../common/common-schemas.yaml#/components/schemas/ErrorResponse'
+              - type: object
+                properties:
+                  paymentId:
+                    $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+  schemas:
+
+    RequestOperationId:
+      type: string
+      description: |
+        Identificador de idempotencia del cliente (UUID recomendado). Máximo **56** caracteres: `transaction-service` le agrega el sufijo `-FEE`
+        a la comisión y el resultado debe caber en los 64 del `OperationId` común. Comparte espacio con los `operationId` de depósitos, retiros y transferencias.
+      minLength: 8
+      maxLength: 56
+      example: 3c1e9b52-7d4a-4f0e-8b1a-6c2d9e5f7a10
+
+    DebitCardStatus:
+      type: string
+      enum: [ACTIVE, CLOSED]
+      description: Una tarjeta vencida sigue `ACTIVE` pero con `expired = true` (se calcula por fecha).
+
+    DebitPaymentStatus:
+      type: string
+      enum: [PENDING, COMPLETED, FAILED]
+
+    ExpiryMonth:
+      type: string
+      description: Mes de vencimiento (`yyyy-MM`). La tarjeta sirve hasta el último día de ese mes.
+      pattern: '^\d{4}-(0[1-9]|1[0-2])$'
+      example: 2031-09
+
+    IssueDebitCardRequest:
+      type: object
+      required: [customerId, accountIds]
+      properties:
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        accountIds:
+          type: array
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        mainAccountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+    ReplaceAccountsRequest:
+      type: object
+      required: [accountIds]
+      properties:
+        accountIds:
+          type: array
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        mainAccountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+    AccountRefRequest:
+      type: object
+      required: [accountId]
+      properties:
+        accountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+    PayRequest:
+      type: object
+      required: [operationId, amount]
+      properties:
+        operationId:
+          $ref: '#/components/schemas/RequestOperationId'
+        amount:
+          type: number
+          minimum: 0.01
+          multipleOf: 0.01
+          description: Mayor que 0, hasta 2 decimales, en soles.
+          example: 45.90
+        description:
+          type: string
+          maxLength: 200
+        accountId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Cuenta de cargo. Debe estar asociada a la tarjeta. Si falta, se usa la principal.
+
+    DebitCard:
+      type: object
+      required: [id, customerId, maskedNumber, expiryDate, expired, status, accountIds, mainAccountId, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        maskedNumber:
+          type: string
+          description: Solo los últimos 4 dígitos.
+          example: '**** 4821'
+        expiryDate:
+          $ref: '#/components/schemas/ExpiryMonth'
+        expired:
+          type: boolean
+          description: Calculado con la fecha de hoy en la zona horaria del banco.
+        status:
+          $ref: '#/components/schemas/DebitCardStatus'
+        accountIds:
+          type: array
+          description: Cuentas asociadas, en el orden en que se asociaron.
+          items:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        mainAccountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    FailureReason:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          example: INSUFFICIENT_FUNDS
+        message:
+          type: string
+
+    DebitPayment:
+      type: object
+      required: [id, operationId, cardId, customerId, accountId, amount, status, requestedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        operationId:
+          $ref: '#/components/schemas/RequestOperationId'
+        cardId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        accountId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Cuenta de cargo (la indicada o la principal al momento del pago).
+        amount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        description:
+          type: string
+        status:
+          $ref: '#/components/schemas/DebitPaymentStatus'
+        failureReason:
+          allOf:
+            - $ref: '#/components/schemas/FailureReason'
+          description: Solo si `FAILED`.
+        transactionId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Movimiento `DEBIT_PAYMENT` en el historial de la cuenta. Solo si `COMPLETED`.
+        fee:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Comisión que cobró la cuenta. Solo si `COMPLETED` y hubo comisión.
+        resultingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo de la cuenta tras el pago (ya descuenta la comisión). Solo si `COMPLETED`.
+        requestedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          description: Cuándo terminó (`COMPLETED` o `FAILED`). Se omite mientras está `PENDING`.
+
+    DebitPaymentPage:
+      allOf:
+        - $ref: '../common/common-schemas.yaml#/components/schemas/PageMeta'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/DebitPayment'
+
+    RecoveryResult:
+      type: object
+      required: [ranAt, olderThanMinutes, pendingFound, resent, exhausted]
+      properties:
+        ranAt:
+          type: string
+          format: date-time
+        olderThanMinutes:
+          type: integer
+        pendingFound:
+          type: integer
+          description: Pagos `PENDING` con la antigüedad pedida.
+        resent:
+          type: integer
+          description: A los que se les reenvió el pedido de retiro.
+        exhausted:
+          type: integer
+          description: Los que ya llegaron al máximo de reenvíos y no se reenviaron.
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

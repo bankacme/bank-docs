@@ -1,0 +1,204 @@
+openapi: 3.0.3
+info:
+  title: Esquemas comunes del sistema bancario
+  version: 1.0.0
+  description: |
+    Componentes compartidos por los contratos de todos los servicios.
+    No define endpoints: los servicios lo referencian con
+    `$ref: '../common/common-schemas.yaml#/components/...'`.
+paths: {}
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Token emitido por `auth-service` (RS256). Solo se exige con `security.enabled=true` (P3).
+        Los roles permitidos de cada operación se indican en la extensión `x-roles`.
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      description: Número de página, desde 0.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    SizeParam:
+      name: size
+      in: query
+      description: Elementos por página (máximo 100).
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    FromParam:
+      name: from
+      in: query
+      description: Fecha inicial del intervalo, inclusive (yyyy-MM-dd).
+      required: false
+      schema:
+        type: string
+        format: date
+    ToParam:
+      name: to
+      in: query
+      description: Fecha final del intervalo, inclusive (yyyy-MM-dd).
+      required: false
+      schema:
+        type: string
+        format: date
+
+  schemas:
+
+    Id:
+      type: string
+      description: Identificador (UUID v4 en texto) generado por el servicio dueño.
+      minLength: 1
+      maxLength: 36
+      example: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+
+    OperationId:
+      type: string
+      description: |
+        Identificador de idempotencia generado por el cliente (UUID recomendado).
+        Repetir una operación con el mismo valor devuelve el resultado original sin duplicar el efecto.
+      minLength: 8
+      maxLength: 64
+      example: b7f0c2a4-19d2-4c0a-8d6e-3a9c1f7e5b20
+
+    Money:
+      type: number
+      description: Monto en soles (PEN) con como máximo 2 decimales. Mayor que 0 al operar.
+      minimum: 0
+      multipleOf: 0.01
+      example: 150.00
+
+    DocumentType:
+      type: string
+      enum: [DNI, CEX, PASSPORT, RUC]
+      description: |
+        DNI (8 dígitos), CEX (9-12 alfanuméricos), PASSPORT (6-12 alfanuméricos), RUC (11 dígitos, empresas).
+        La validación fina por tipo la hace el dominio.
+
+    Document:
+      type: object
+      required: [type, number]
+      properties:
+        type:
+          $ref: '#/components/schemas/DocumentType'
+        number:
+          type: string
+          minLength: 6
+          maxLength: 12
+          pattern: '^[A-Za-z0-9]{6,12}$'
+          example: '12345678'
+
+    PageMeta:
+      type: object
+      description: Datos de paginación. Los listados paginados lo combinan con su propio `content`.
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page:
+          type: integer
+          example: 0
+        size:
+          type: integer
+          example: 20
+        totalElements:
+          type: integer
+          format: int64
+          example: 134
+        totalPages:
+          type: integer
+          example: 7
+
+    ErrorResponse:
+      type: object
+      description: Cuerpo estándar de error de todos los servicios.
+      required: [timestamp, status, code, message, path]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-09-24T15:24:00Z'
+        status:
+          type: integer
+          example: 422
+        code:
+          type: string
+          description: Código de negocio estable, en mayúsculas (por ejemplo `INSUFFICIENT_FUNDS`).
+          example: INSUFFICIENT_FUNDS
+        message:
+          type: string
+          description: Mensaje legible. No incluye datos personales completos.
+          example: El saldo es insuficiente para el retiro.
+        path:
+          type: string
+          example: /api/v1/withdrawals
+        details:
+          type: array
+          description: Errores por campo (solo en 400 `VALIDATION_ERROR`).
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          example: contact.email
+        message:
+          type: string
+          example: debe ser un correo válido
+
+  responses:
+    BadRequest:
+      description: Formato inválido (código `VALIDATION_ERROR`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Sin token o token inválido o vencido (`UNAUTHORIZED`). Solo con seguridad activa.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: El rol no permite la operación o el recurso es de otro cliente (`FORBIDDEN`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: El recurso no existe (código propio del recurso, por ejemplo `CUSTOMER_NOT_FOUND`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Duplicado o conflicto de estado (por ejemplo `DOCUMENT_ALREADY_REGISTERED`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnprocessableEntity:
+      description: Regla de negocio incumplida. El `code` indica cuál.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: Otro servicio no respondió en 2 s o el circuito está abierto (`SERVICE_UNAVAILABLE`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

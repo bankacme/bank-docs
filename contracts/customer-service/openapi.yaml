@@ -1,0 +1,354 @@
+openapi: 3.0.3
+info:
+  title: customer-service
+  version: 1.0.0
+  description: |
+    Clientes del banco: tipo (personal o empresa), perfil (Standard, VIP, PYME), documento único y datos de contacto.
+    Eliminar es una **baja lógica** (`INACTIVE`). El documento y el tipo no cambian después de creado el cliente.
+
+    Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
+servers:
+  - url: /api/v1
+tags:
+  - name: Customers
+security:
+  - bearerAuth: []
+
+paths:
+
+  /customers:
+    post:
+      tags: [Customers]
+      operationId: createCustomer
+      summary: Crear un cliente
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Valida documento único, coherencia tipo-documento y tipo-perfil.
+        Si no se indica `profile`, se crea como `STANDARD`.
+        Errores 422: `DOCUMENT_TYPE_NOT_ALLOWED` (personal con RUC o empresa sin RUC), `INVALID_DOCUMENT` (el número no cumple el formato de su tipo), `PROFILE_NOT_ALLOWED` (VIP para empresa o PYME para persona).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCustomerRequest'
+            examples:
+              personal:
+                summary: Cliente personal
+                value:
+                  type: PERSONAL
+                  name: Ana Torres Ríos
+                  document: { type: DNI, number: '12345678' }
+                  contact: { email: ana.torres@example.com, phone: '987654321', address: 'Av. Los Olivos 123, Lima' }
+              empresa:
+                summary: Empresa PYME
+                value:
+                  type: BUSINESS
+                  profile: PYME
+                  name: Bodega San Martín S.A.C.
+                  document: { type: RUC, number: '20512345678' }
+                  contact: { email: contacto@bodegasanmartin.example.com, phone: '912345678' }
+      responses:
+        '201':
+          description: Cliente creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    get:
+      tags: [Customers]
+      operationId: listCustomers
+      summary: Listar clientes
+      x-roles: [ADMIN, TELLER]
+      description: Sin paginación (volumen pequeño en el demo). Sin filtros devuelve todos, ordenados por fecha de creación descendente.
+      parameters:
+        - name: type
+          in: query
+          schema:
+            $ref: '#/components/schemas/CustomerType'
+        - name: profile
+          in: query
+          schema:
+            $ref: '#/components/schemas/CustomerProfile'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/CustomerStatus'
+      responses:
+        '200':
+          description: Lista de clientes (puede ser vacía).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /customers/by-document:
+    get:
+      tags: [Customers]
+      operationId: getCustomerByDocument
+      summary: Buscar un cliente por documento
+      x-roles: [ADMIN, TELLER]
+      description: Lo usa el personal para vincular usuarios y para ubicar clientes.
+      parameters:
+        - name: documentType
+          in: query
+          required: true
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/DocumentType'
+        - name: documentNumber
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 6
+            maxLength: 12
+            pattern: '^[A-Za-z0-9]{6,12}$'
+      responses:
+        '200':
+          description: Cliente encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /customers/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    get:
+      tags: [Customers]
+      operationId: getCustomer
+      summary: Obtener un cliente por id
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo puede consultar el cliente cuyo id es su `customerId` del token.
+      responses:
+        '200':
+          description: Cliente encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Customers]
+      operationId: updateCustomer
+      summary: Actualizar nombre y contacto
+      x-roles: [ADMIN, TELLER]
+      description: |
+        No cambia documento, tipo ni perfil. Un cliente `INACTIVE` no se puede actualizar (422 `CUSTOMER_INACTIVE`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCustomerRequest'
+      responses:
+        '200':
+          description: Cliente actualizado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Customers]
+      operationId: deleteCustomer
+      summary: Dar de baja un cliente (baja lógica)
+      x-roles: [ADMIN, TELLER]
+      description: 'Pasa el cliente a `INACTIVE`. Es idempotente, repetir la baja también responde 204.'
+      responses:
+        '204':
+          description: Cliente dado de baja.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /customers/{id}/profile:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    patch:
+      tags: [Customers]
+      operationId: changeCustomerProfile
+      summary: Cambiar el perfil del cliente
+      x-roles: [ADMIN, TELLER]
+      description: |
+        `VIP` solo para clientes personales; `PYME` solo para empresas; `STANDARD` para ambos.
+        Errores 422: `PROFILE_NOT_ALLOWED`, `CUSTOMER_INACTIVE`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeProfileRequest'
+      responses:
+        '200':
+          description: Perfil actualizado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+components:
+  schemas:
+
+    CustomerType:
+      type: string
+      enum: [PERSONAL, BUSINESS]
+      description: Personal (DNI, CEX o PASSPORT) o empresa (RUC). No cambia después de creado.
+
+    CustomerProfile:
+      type: string
+      enum: [STANDARD, VIP, PYME]
+      description: '`VIP` solo para personales; `PYME` solo para empresas.'
+
+    CustomerStatus:
+      type: string
+      enum: [ACTIVE, INACTIVE]
+
+    Contact:
+      type: object
+      required: [email, phone]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          example: ana.torres@example.com
+        phone:
+          type: string
+          pattern: '^9[0-9]{8}$'
+          description: Celular de 9 dígitos que empieza con 9.
+          example: '987654321'
+        address:
+          type: string
+          maxLength: 200
+          example: 'Av. Los Olivos 123, Lima'
+
+    CreateCustomerRequest:
+      type: object
+      required: [type, name, document, contact]
+      properties:
+        type:
+          $ref: '#/components/schemas/CustomerType'
+        profile:
+          allOf:
+            - $ref: '#/components/schemas/CustomerProfile'
+          description: Opcional. Por defecto `STANDARD`.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 150
+          description: Nombre completo (personal) o razón social (empresa).
+          example: Ana Torres Ríos
+        document:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Document'
+        contact:
+          $ref: '#/components/schemas/Contact'
+
+    UpdateCustomerRequest:
+      type: object
+      required: [name, contact]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 150
+        contact:
+          $ref: '#/components/schemas/Contact'
+
+    ChangeProfileRequest:
+      type: object
+      required: [profile]
+      properties:
+        profile:
+          $ref: '#/components/schemas/CustomerProfile'
+
+    Customer:
+      type: object
+      required: [id, type, profile, name, document, contact, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        type:
+          $ref: '#/components/schemas/CustomerType'
+        profile:
+          $ref: '#/components/schemas/CustomerProfile'
+        name:
+          type: string
+          example: Ana Torres Ríos
+        document:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Document'
+        contact:
+          $ref: '#/components/schemas/Contact'
+        status:
+          $ref: '#/components/schemas/CustomerStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

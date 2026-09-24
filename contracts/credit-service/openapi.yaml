@@ -1,0 +1,895 @@
+openapi: 3.0.3
+info:
+  title: credit-service
+  version: 1.0.0
+  description: |
+    Créditos y tarjetas de crédito (personales y empresariales), sus pagos y consumos, y la **detección de deuda vencida**.
+
+    - Crédito: un monto, un saldo pendiente y **una** fecha de vencimiento (sin cuotas ni intereses). Tarjeta: línea, monto usado y fecha de pago.
+    - **Vencido** = fecha ya pasada y saldo pendiente mayor que 0. La deuda vencida **solo bloquea adquirir** productos nuevos
+      (créditos y tarjetas aquí; cuentas y tarjetas de débito en sus servicios). No bloquea pagos ni consumos.
+    - El pago **no debita ninguna cuenta**: se registra directo sobre el producto. Cualquier cliente puede pagar productos de terceros.
+    - **Idempotencia:** pagos y consumos llevan `operationId`; repetir devuelve el resultado original (200) sin volver a aplicar.
+    - Eliminar es una **baja lógica** (`CLOSED`) y solo con saldo 0.
+
+    Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
+servers:
+  - url: /api/v1
+tags:
+  - name: Credits
+  - name: Credit cards
+  - name: Overdue debt
+  - name: Internal
+    description: Solo para administración. No se usa desde clientes finales.
+security:
+  - bearerAuth: []
+
+paths:
+
+  /credits:
+    post:
+      tags: [Credits]
+      operationId: openCredit
+      summary: Otorgar un crédito
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo puede pedir créditos para su propio `customerId`.
+      description: |
+        El tipo del crédito (`ownerType`) es el del cliente. El saldo pendiente inicial es el monto. No se exige cuenta bancaria.
+
+        Validaciones en este orden: cliente existe (404 `CUSTOMER_NOT_FOUND`) → activo (422 `CUSTOMER_INACTIVE`) →
+        personal con otro crédito **no pagado** (`ACTIVE` u `OVERDUE`; 422 `PERSONAL_CREDIT_LIMIT_REACHED`; uno `PAID` no cuenta; una empresa puede tener varios) →
+        deuda vencida en cualquier producto del cliente (422 `OVERDUE_DEBT`) → vencimiento futuro (422 `INVALID_DUE_DATE`; con `credit.demo-mode=true` se acepta una fecha pasada).
+        503 `SERVICE_UNAVAILABLE` si `customer-service` no responde en 2 s (P1/P2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenCreditRequest'
+            examples:
+              credito:
+                value:
+                  customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                  amount: 5000.00
+                  dueDate: '2026-12-31'
+      responses:
+        '201':
+          description: Crédito otorgado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credit'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Credits]
+      operationId: listCredits
+      summary: Listar créditos
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve los suyos; el servicio fuerza `customerId` al del token (403 si pide otro).
+      description: Sin paginación. Más recientes primero. Sin filtros devuelve todos (solo `ADMIN` y `TELLER`).
+      parameters:
+        - $ref: '#/components/parameters/CustomerIdFilter'
+        - name: ownerType
+          in: query
+          schema:
+            $ref: '#/components/schemas/OwnerType'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/CreditStatus'
+      responses:
+        '200':
+          description: Lista de créditos (puede ser vacía).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Credit'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /credits/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      tags: [Credits]
+      operationId: getCredit
+      summary: Obtener un crédito
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve créditos cuyo `customerId` es el del token.
+      responses:
+        '200':
+          description: Crédito encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credit'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Credits]
+      operationId: rescheduleCredit
+      summary: Reprogramar el vencimiento
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Cambia solo la fecha de vencimiento. La nueva fecha debe ser futura (422 `INVALID_DUE_DATE`; el modo demo acepta pasadas).
+        Un crédito `OVERDUE` reprogramado a una fecha futura vuelve a `ACTIVE`; si era el último producto vencido del cliente se levanta el bloqueo.
+        422 `INVALID_STATE` si el crédito está `PAID` o `CLOSED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RescheduleCreditRequest'
+      responses:
+        '200':
+          description: Crédito reprogramado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credit'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Credits]
+      operationId: closeCredit
+      summary: Dar de baja un crédito (baja lógica)
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Pasa el crédito a `CLOSED`. Solo con saldo pendiente 0 (422 `NOT_CLOSABLE`). Idempotente: repetir también responde 204.
+      responses:
+        '204':
+          description: Crédito dado de baja.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /credits/{id}/payments:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    post:
+      tags: [Credits]
+      operationId: payCredit
+      summary: Pagar un crédito (propio o de un tercero)
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` puede pagar créditos de **cualquier** cliente, pero como pagador es él mismo (si envía `payerCustomerId` debe ser el suyo, 403 si no).
+      description: |
+        Idempotente por `operationId`. Pago parcial baja el saldo pendiente; pago total pasa el crédito a `PAID`.
+        Un pago parcial **no** limpia la deuda vencida; el pago total sí (y publica el aviso si era el último producto vencido del cliente).
+
+        Errores 422: `OVERPAYMENT` (monto mayor al saldo pendiente), `INVALID_STATE` (crédito `PAID` o `CLOSED`).
+        409 `OPERATION_ID_REUSED` si el `operationId` ya se usó con otro producto, tipo o monto.
+        La respuesta no depende de que el historial se haya registrado en `transaction-service` (se reintenta aparte).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+            examples:
+              pagoDeTercero:
+                value:
+                  operationId: 0c8e5f11-3a7b-4d2c-9b1e-6f4a2d8c7e90
+                  amount: 300.00
+                  payerCustomerId: c0a1b2c3-d4e5-4f60-8a9b-0c1d2e3f4a5b
+      responses:
+        '200':
+          $ref: '#/components/responses/PaymentOk'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /credits/{id}/payment-info:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      tags: [Credits]
+      operationId: getCreditPaymentInfo
+      summary: Vista limitada de un crédito para pagarlo (también de terceros)
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      description: 'Solo lo necesario para pagar: estado, saldo pendiente y vencimiento. No muestra al dueño ni datos personales.'
+      responses:
+        '200':
+          description: Información de pago.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentInfo'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /credit-cards:
+    post:
+      tags: [Credit cards]
+      operationId: issueCreditCard
+      summary: Emitir una tarjeta de crédito
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo puede pedir tarjetas para su propio `customerId`.
+      description: |
+        Sin límite de tarjetas por cliente. Nace `ACTIVE`, sin saldo usado y sin fecha de pago. El número es ficticio de 16 dígitos y
+        **solo se expone enmascarado**. Mismas validaciones de cliente que el crédito (404 `CUSTOMER_NOT_FOUND`, 422 `CUSTOMER_INACTIVE`, 422 `OVERDUE_DEBT`), sin el tope de créditos.
+        503 `SERVICE_UNAVAILABLE` si `customer-service` no responde en 2 s (P1/P2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueCreditCardRequest'
+      responses:
+        '201':
+          description: Tarjeta emitida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Credit cards]
+      operationId: listCreditCards
+      summary: Listar tarjetas de crédito
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve las suyas; el servicio fuerza `customerId` al del token (403 si pide otro).
+      description: |
+        Sin paginación. Más recientes primero. `account-service` la usa en P2 con `customerId` y `status=ACTIVE` para saber si el cliente
+        tiene una tarjeta activa (una `OVERDUE` o `CLOSED` no cuenta). Esa llamada solo existe en P2 (sin seguridad); en P3 `account-service` usa su propia copia por eventos.
+      parameters:
+        - $ref: '#/components/parameters/CustomerIdFilter'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/CardStatus'
+      responses:
+        '200':
+          description: Lista de tarjetas (puede ser vacía).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CreditCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /credit-cards/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      tags: [Credit cards]
+      operationId: getCreditCard
+      summary: Obtener una tarjeta de crédito
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve tarjetas cuyo `customerId` es el del token.
+      responses:
+        '200':
+          description: Tarjeta encontrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCard'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Credit cards]
+      operationId: changeCreditCardLimit
+      summary: Cambiar la línea de crédito
+      x-roles: [ADMIN, TELLER]
+      description: |
+        La nueva línea no puede ser menor al monto usado (422 `LIMIT_BELOW_USED_AMOUNT`). 422 `INVALID_STATE` si la tarjeta está `CLOSED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeLimitRequest'
+      responses:
+        '200':
+          description: Línea actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCard'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Credit cards]
+      operationId: closeCreditCard
+      summary: Dar de baja una tarjeta (baja lógica)
+      x-roles: [ADMIN, TELLER]
+      description: Pasa la tarjeta a `CLOSED`. Solo con monto usado 0 (422 `NOT_CLOSABLE`). Idempotente.
+      responses:
+        '204':
+          description: Tarjeta dada de baja.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /credit-cards/{id}/balance:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      tags: [Credit cards]
+      operationId: getCreditCardBalance
+      summary: Saldo disponible de una tarjeta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve tarjetas cuyo `customerId` es el del token.
+      responses:
+        '200':
+          description: Línea, usado, disponible, fecha de pago y estado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CardBalance'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /credit-cards/{id}/charges:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    post:
+      tags: [Credit cards]
+      operationId: chargeCreditCard
+      summary: Registrar un consumo
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo consume con sus propias tarjetas.
+      description: |
+        Idempotente por `operationId`. El consumo no puede superar el crédito disponible (422 `CREDIT_LIMIT_EXCEEDED`).
+        Al primer consumo con saldo usado 0, la **fecha de pago** = hoy + `credit.card.payment-term-days` (30). Los consumos siguientes no la mueven.
+        Una tarjeta `OVERDUE` **sí puede consumir** (la deuda vencida no bloquea consumos). 422 `INVALID_STATE` si está `CLOSED`.
+        409 `OPERATION_ID_REUSED` si el `operationId` ya se usó con otra tarjeta, tipo o monto.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChargeRequest'
+      responses:
+        '200':
+          description: Consumo aplicado (o resultado original si se repitió).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeResult'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /credit-cards/{id}/payments:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    post:
+      tags: [Credit cards]
+      operationId: payCreditCard
+      summary: Pagar una tarjeta de crédito (propia o de un tercero)
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` puede pagar tarjetas de **cualquier** cliente, pero como pagador es él mismo (si envía `payerCustomerId` debe ser el suyo, 403 si no).
+      description: |
+        Idempotente por `operationId`. Baja el monto usado. Con pago total (usado 0) se limpia la fecha de pago y una tarjeta `OVERDUE` vuelve a `ACTIVE`
+        (si era el último producto vencido del cliente se levanta el bloqueo). Un pago parcial no limpia la deuda vencida.
+        Errores 422: `OVERPAYMENT` (monto mayor al usado), `INVALID_STATE` (tarjeta `CLOSED`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/PaymentOk'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /credit-cards/{id}/payment-info:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      tags: [Credit cards]
+      operationId: getCreditCardPaymentInfo
+      summary: Vista limitada de una tarjeta para pagarla (también de terceros)
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      description: 'Solo lo necesario para pagar: número enmascarado, estado, monto usado y fecha de pago. No muestra al dueño.'
+      responses:
+        '200':
+          description: Información de pago.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentInfo'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /overdue-checks:
+    post:
+      tags: [Overdue debt]
+      operationId: runOverdueCheck
+      summary: Ejecutar ahora la revisión de deuda vencida
+      x-roles: [ADMIN]
+      description: |
+        Hace lo mismo que el proceso diario. Marca `OVERDUE` los créditos y tarjetas `ACTIVE` con fecha anterior a `asOf` y saldo mayor que 0.
+        - **Idempotente:** un producto que ya está `OVERDUE` no se vuelve a marcar ni a publicar.
+        - `asOf` (opcional, por defecto hoy) permite simular otra fecha en el demo. Un `asOf` futuro marca productos que aún no vencen de verdad; se deshace pagando o reprogramando.
+        - Publica un aviso de vencido por **producto** que pasa a vencido.
+      parameters:
+        - name: asOf
+          in: query
+          required: false
+          description: Fecha de referencia (`yyyy-MM-dd`). Por defecto, hoy en la zona del banco.
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Resultado de la revisión.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OverdueCheckResult'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /credit-recovery-runs:
+    post:
+      tags: [Internal]
+      operationId: runCreditRecovery
+      summary: Reintentar el registro pendiente de pagos y consumos en el historial
+      x-roles: [ADMIN]
+      description: |
+        En P1/P2, `credit-service` registra cada pago y consumo en `transaction-service` **después** de aplicarlo. Si ese registro falla,
+        la operación queda marcada como no registrada y este proceso (también programado) la reintenta con el mismo `operationId`
+        (idempotente en `transaction-service`). En P3 el aviso va por eventos y este proceso no encuentra nada.
+      parameters:
+        - name: olderThanMinutes
+          in: query
+          required: false
+          description: Antigüedad mínima en minutos. Por defecto, el valor configurado. Con `0` toma todas (útil en la demo).
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1440
+      responses:
+        '200':
+          description: Resultado de la corrida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryResult'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+components:
+
+  parameters:
+    ProductId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    CustomerIdFilter:
+      name: customerId
+      in: query
+      required: false
+      schema:
+        $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+  responses:
+    PaymentOk:
+      description: Pago aplicado (o resultado original si se repitió).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PaymentResult'
+
+  schemas:
+
+    CreditAmount:
+      type: number
+      minimum: 0.01
+      maximum: 999999999.99
+      multipleOf: 0.01
+      description: Monto en soles, mayor que 0, hasta 2 decimales.
+      example: 5000.00
+
+    OwnerType:
+      type: string
+      enum: [PERSONAL, BUSINESS]
+      description: Se deriva del tipo del cliente; no lo elige el usuario.
+
+    CreditStatus:
+      type: string
+      enum: [ACTIVE, OVERDUE, PAID, CLOSED]
+      description: |
+        `ACTIVE` → `OVERDUE` (fecha pasada con saldo). `OVERDUE` → `ACTIVE` (reprogramar a fecha futura) o → `PAID` (pago total).
+        `PAID` → `CLOSED` (baja lógica).
+
+    CardStatus:
+      type: string
+      enum: [ACTIVE, OVERDUE, CLOSED]
+      description: '`OVERDUE` → `ACTIVE` con el pago total. Solo una tarjeta `ACTIVE` cuenta como "activa" para los perfiles VIP y PYME.'
+
+    ProductType:
+      type: string
+      enum: [CREDIT, CREDIT_CARD]
+
+    OpenCreditRequest:
+      type: object
+      required: [customerId, amount, dueDate]
+      properties:
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        amount:
+          $ref: '#/components/schemas/CreditAmount'
+        dueDate:
+          type: string
+          format: date
+          description: Fecha de vencimiento (`yyyy-MM-dd`). Futura, salvo en modo demo.
+          example: '2026-12-31'
+
+    RescheduleCreditRequest:
+      type: object
+      required: [dueDate]
+      properties:
+        dueDate:
+          type: string
+          format: date
+
+    IssueCreditCardRequest:
+      type: object
+      required: [customerId, creditLimit]
+      properties:
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        creditLimit:
+          $ref: '#/components/schemas/CreditAmount'
+
+    ChangeLimitRequest:
+      type: object
+      required: [creditLimit]
+      properties:
+        creditLimit:
+          $ref: '#/components/schemas/CreditAmount'
+
+    PaymentRequest:
+      type: object
+      required: [operationId, amount]
+      properties:
+        operationId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        amount:
+          $ref: '#/components/schemas/CreditAmount'
+        payerCustomerId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: |
+            Quién paga. Se omite si paga el propio dueño. Si es un `CUSTOMER` el que llama, debe ser él mismo.
+            No se valida que exista en `customer-service` (el pago no depende de otros servicios).
+
+    ChargeRequest:
+      type: object
+      required: [operationId, amount]
+      properties:
+        operationId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        amount:
+          $ref: '#/components/schemas/CreditAmount'
+        description:
+          type: string
+          maxLength: 200
+          example: Compra en supermercado
+
+    Credit:
+      type: object
+      required: [id, customerId, ownerType, principalAmount, outstandingBalance, dueDate, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        ownerType:
+          $ref: '#/components/schemas/OwnerType'
+        principalAmount:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Monto otorgado.
+        outstandingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo pendiente. Baja con los pagos; 0 cuando está `PAID`.
+        dueDate:
+          type: string
+          format: date
+        status:
+          $ref: '#/components/schemas/CreditStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    CreditCard:
+      type: object
+      required: [id, customerId, ownerType, maskedNumber, creditLimit, usedAmount, availableCredit, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        ownerType:
+          $ref: '#/components/schemas/OwnerType'
+        maskedNumber:
+          type: string
+          example: '**** 4821'
+        creditLimit:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        usedAmount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        availableCredit:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: '`creditLimit − usedAmount` (calculado).'
+        paymentDueDate:
+          type: string
+          format: date
+          description: Solo con monto usado mayor que 0.
+        status:
+          $ref: '#/components/schemas/CardStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    CardBalance:
+      type: object
+      required: [cardId, status, creditLimit, usedAmount, availableCredit, asOf]
+      properties:
+        cardId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/CardStatus'
+        creditLimit:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        usedAmount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        availableCredit:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        paymentDueDate:
+          type: string
+          format: date
+        asOf:
+          type: string
+          format: date-time
+
+    PaymentInfo:
+      type: object
+      description: Vista limitada para quien va a pagar (incluye terceros). No revela al dueño.
+      required: [productType, productId, status, amountDue]
+      properties:
+        productType:
+          $ref: '#/components/schemas/ProductType'
+        productId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        maskedNumber:
+          type: string
+          description: Solo tarjetas.
+          example: '**** 4821'
+        status:
+          type: string
+          enum: [ACTIVE, OVERDUE, PAID, CLOSED]
+        amountDue:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo pendiente del crédito o monto usado de la tarjeta.
+        dueDate:
+          type: string
+          format: date
+          description: Vencimiento del crédito o fecha de pago de la tarjeta (se omite si no hay).
+
+    PaymentResult:
+      type: object
+      description: Resultado inmutable de un pago. Al repetir el `operationId` se devuelve este mismo resultado.
+      required: [operationId, productType, productId, amount, resultingBalance, status]
+      properties:
+        operationId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        productType:
+          $ref: '#/components/schemas/ProductType'
+        productId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        amount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        resultingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo pendiente del crédito o monto usado de la tarjeta tras el pago.
+        status:
+          type: string
+          enum: [ACTIVE, OVERDUE, PAID, CLOSED]
+          description: Estado del producto tras el pago.
+        payerCustomerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+    ChargeResult:
+      type: object
+      required: [operationId, cardId, amount, usedAmount, availableCredit, status]
+      properties:
+        operationId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        cardId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        amount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        usedAmount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        availableCredit:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        paymentDueDate:
+          type: string
+          format: date
+        status:
+          $ref: '#/components/schemas/CardStatus'
+
+    OverdueCheckResult:
+      type: object
+      required: [asOf, ranAt, creditsMarked, cardsMarked, customersAffected]
+      properties:
+        asOf:
+          type: string
+          format: date
+        ranAt:
+          type: string
+          format: date-time
+        creditsMarked:
+          type: integer
+          description: Créditos que pasaron a `OVERDUE` en esta corrida.
+        cardsMarked:
+          type: integer
+          description: Tarjetas que pasaron a `OVERDUE` en esta corrida.
+        customersAffected:
+          type: integer
+          description: Clientes distintos con al menos un producto marcado en esta corrida.
+
+    RecoveryResult:
+      type: object
+      required: [ranAt, olderThanMinutes, found, recorded, stillPending]
+      properties:
+        ranAt:
+          type: string
+          format: date-time
+        olderThanMinutes:
+          type: integer
+        found:
+          type: integer
+          description: Operaciones aplicadas y aún no registradas en el historial.
+        recorded:
+          type: integer
+        stillPending:
+          type: integer
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

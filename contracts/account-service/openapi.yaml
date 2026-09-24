@@ -1,0 +1,761 @@
+openapi: 3.0.3
+info:
+  title: account-service
+  version: 1.0.0
+  description: |
+    Cuentas bancarias (ahorro, corriente y plazo fijo): apertura con reglas por tipo de cliente y perfil,
+    saldo, movimientos con límites y comisiones, y el catálogo de condiciones.
+
+    - **Dueño del saldo.** El saldo solo cambia por movimientos (`/accounts/{id}/movements`) y sus reversas.
+    - Eliminar una cuenta es una **baja lógica** (`INACTIVE`) y solo con saldo 0.
+    - Los dos endpoints de movimientos son **internos** (`x-internal: true`): los usa `transaction-service` en P1/P2 y
+      **no** se publican en el Gateway. En P3 el mismo caso de uso se dispara con comandos de Kafka (`account.command`).
+    - Los depósitos y retiros que ve el cliente (`POST /deposits`, `POST /withdrawals`) pertenecen a `transaction-service`.
+
+    Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
+servers:
+  - url: /api/v1
+tags:
+  - name: Accounts
+  - name: Account conditions
+  - name: Internal movements
+    description: Solo para servicios del banco. No se expone por el Gateway.
+security:
+  - bearerAuth: []
+
+paths:
+
+  /accounts:
+    post:
+      tags: [Accounts]
+      operationId: openAccount
+      summary: Abrir una cuenta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo puede abrir cuentas para su propio `customerId` (el del token).
+      description: |
+        Las condiciones (comisiones, límites, mínimos) se eligen del catálogo por (`type`, perfil del cliente) y **se copian a la cuenta**.
+        Si no existe la combinación, se usa `STANDARD` del mismo tipo. Un cambio posterior del catálogo no afecta cuentas ya abiertas.
+        El `openingAmount` (por defecto 0) pasa a ser el saldo inicial y no cuenta como movimiento.
+
+        Errores:
+        - 404 `CUSTOMER_NOT_FOUND`.
+        - 422 `CUSTOMER_INACTIVE`, `OVERDUE_DEBT`, `ACCOUNT_TYPE_NOT_ALLOWED` (empresa solo abre corriente),
+          `SAVINGS_LIMIT_REACHED` y `CHECKING_LIMIT_REACHED` (personal: máximo 1 activa de cada tipo),
+          `CREDIT_CARD_REQUIRED` (ahorro VIP y corriente PYME exigen una tarjeta de crédito `ACTIVE`),
+          `PARTIES_NOT_ALLOWED` (personal con titulares o firmantes), `HOLDER_REQUIRED` (empresa sin titular),
+          `MOVEMENT_DAY_REQUIRED` (plazo fijo sin día), `MOVEMENT_DAY_NOT_ALLOWED` (día en una cuenta que no es de plazo fijo),
+          `INSUFFICIENT_OPENING_AMOUNT` (menor que el mínimo de la condición).
+        - 503 `SERVICE_UNAVAILABLE` si `customer-service` o `credit-service` no responden en 2 s (P1/P2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenAccountRequest'
+            examples:
+              ahorro:
+                summary: Ahorro personal con monto de apertura
+                value:
+                  customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                  type: SAVINGS
+                  alias: Ahorros del viaje
+                  openingAmount: 1000.00
+              plazoFijo:
+                summary: Plazo fijo (mínimo de apertura 100)
+                value:
+                  customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                  type: FIXED_TERM
+                  openingAmount: 500.00
+                  movementDayOfMonth: 15
+              empresarial:
+                summary: Corriente empresarial con titular y firmante
+                value:
+                  customerId: 9a8b7c6d-1e2f-4a3b-8c4d-5e6f7a8b9c0d
+                  type: CHECKING
+                  alias: Cuenta operativa
+                  holders:
+                    - document: { type: DNI, number: '40123456' }
+                      fullName: Rosa Salas Peña
+                  signers:
+                    - document: { type: DNI, number: '40987654' }
+                      fullName: Luis Vega Ramos
+      responses:
+        '201':
+          description: Cuenta abierta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Accounts]
+      operationId: listAccounts
+      summary: Listar cuentas
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo ve sus cuentas; el servicio fuerza `customerId` al del token (si envía otro, 403).
+      description: |
+        Sin paginación (volumen pequeño en el demo). Sin filtros devuelve todas (solo `ADMIN` y `TELLER`), más recientes primero.
+        Por eficiencia se consulta por `customerId` cuando viene y el resto de filtros se aplica en memoria.
+      parameters:
+        - name: customerId
+          in: query
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        - name: type
+          in: query
+          schema:
+            $ref: '#/components/schemas/AccountType'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/AccountStatus'
+      responses:
+        '200':
+          description: Lista de cuentas (puede ser vacía).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Account'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /accounts/{id}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [Accounts]
+      operationId: getAccount
+      summary: Obtener una cuenta
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo accede a cuentas cuyo `customerId` es el del token.
+      responses:
+        '200':
+          description: Cuenta encontrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Accounts]
+      operationId: updateAccount
+      summary: Actualizar alias, titulares y firmantes
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Reemplaza `alias`, `holders` y `signers` (lo que no se envía se vacía; `alias` se borra si se omite).
+        No cambia tipo, cliente, saldo ni condiciones.
+        Errores 422: `ACCOUNT_INACTIVE`, `PARTIES_NOT_ALLOWED` (cuenta personal con titulares o firmantes), `HOLDER_REQUIRED` (empresarial sin titular).
+        Si dos actualizaciones chocan y se agotan los reintentos: 409 `CONCURRENT_MODIFICATION`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountRequest'
+      responses:
+        '200':
+          description: Cuenta actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Accounts]
+      operationId: closeAccount
+      summary: Dar de baja una cuenta (baja lógica)
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Pasa la cuenta a `INACTIVE`. Solo con saldo 0 (422 `BALANCE_NOT_ZERO`).
+        Es idempotente: repetir la baja también responde 204.
+      responses:
+        '204':
+          description: Cuenta dada de baja.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /accounts/{id}/balance:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [Accounts]
+      operationId: getAccountBalance
+      summary: Consultar saldo (y promedio diario si la cuenta lo exige)
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo accede a cuentas cuyo `customerId` es el del token.
+      description: |
+        `dailyAverage` solo aparece si las condiciones de la cuenta tienen `minimumDailyAverage` (cuenta de ahorro VIP).
+        No bloquea nada: solo informa si cumple.
+      responses:
+        '200':
+          description: Saldo actual.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceView'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /account-conditions:
+    get:
+      tags: [Account conditions]
+      operationId: listAccountConditions
+      summary: Ver el catálogo de condiciones
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      description: Una entrada por (tipo de cuenta, perfil). Sin filtros devuelve todo el catálogo.
+      parameters:
+        - name: accountType
+          in: query
+          schema:
+            $ref: '#/components/schemas/AccountType'
+        - name: profile
+          in: query
+          schema:
+            $ref: '#/components/schemas/CustomerProfile'
+      responses:
+        '200':
+          description: Catálogo (puede ser vacío si el filtro no coincide).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AccountProduct'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /account-conditions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Id natural de la entrada del catálogo (`<TIPO>_<PERFIL>`, por ejemplo `SAVINGS_VIP`).
+        schema:
+          $ref: '#/components/schemas/ProductId'
+    put:
+      tags: [Account conditions]
+      operationId: updateAccountConditions
+      summary: Editar las condiciones de una entrada del catálogo
+      x-roles: [ADMIN]
+      description: |
+        Reemplaza **todas** las condiciones de la entrada. No cambia el tipo ni el perfil.
+        Solo afecta cuentas que se abran después: las cuentas existentes conservan su copia.
+        Errores: 404 `CONDITIONS_NOT_FOUND`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountConditions'
+      responses:
+        '200':
+          description: Condiciones actualizadas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountProduct'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+
+  /accounts/{id}/movements:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [Internal movements]
+      operationId: applyMovement
+      summary: "Interno: aplicar un depósito o retiro"
+      x-internal: true
+      x-roles: [ADMIN]
+      description: |
+        Aplica el movimiento con todas las reglas de la cuenta y **es idempotente por `operationId`**:
+        repetir el mismo `operationId` devuelve el resultado original (200, o el mismo 422 si fue rechazado) sin volver a aplicar nada.
+        Reusar un `operationId` con otra cuenta, tipo o monto responde 409 `OPERATION_ID_REUSED`.
+
+        Orden de las validaciones: cuenta activa → monto → `date` → día y tope mensual → comisión → saldo.
+        - La comisión se cobra cuando `movementNumber` (movimientos del mes, contando este) supera `freeTransactionsLimit`. Se descuenta del saldo, también en depósitos.
+        - El saldo resultante nunca queda negativo: retiro con `amount + fee > balance` → 422 `INSUFFICIENT_FUNDS`; un depósito menor que la comisión también.
+        - `date` es opcional (por defecto hoy). No puede ser futura ni anterior al último movimiento de la cuenta (422 `INVALID_DATE`).
+
+        Errores 422 (mismo `code` que el `reasonCode` del evento `account.movement.rejected`):
+        `ACCOUNT_INACTIVE`, `INVALID_AMOUNT`, `INVALID_DATE`, `NOT_ALLOWED_DAY`, `MONTHLY_LIMIT_EXCEEDED`, `INSUFFICIENT_FUNDS`.
+        409 `CONCURRENT_MODIFICATION` si se agotan los reintentos por conflicto de versión.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyMovementRequest'
+            examples:
+              retiro:
+                value:
+                  operationId: b7f0c2a4-19d2-4c0a-8d6e-3a9c1f7e5b20-OUT
+                  type: WITHDRAWAL
+                  amount: 150.00
+                  date: '2026-09-24'
+      responses:
+        '200':
+          description: Movimiento aplicado (o resultado original si se repitió).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MovementResult'
+              examples:
+                conComision:
+                  value:
+                    operationId: b7f0c2a4-19d2-4c0a-8d6e-3a9c1f7e5b20-OUT
+                    accountId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                    type: WITHDRAWAL
+                    amount: 150.00
+                    fee: 2.00
+                    newBalance: 848.00
+                    movementNumber: 6
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /accounts/{id}/movements/{operationId}/reversal:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+      - name: operationId
+        in: path
+        required: true
+        description: El `operationId` de la operación **original** a revertir.
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+    post:
+      tags: [Internal movements]
+      operationId: reverseMovement
+      summary: "Interno: revertir (compensar) un movimiento"
+      x-internal: true
+      x-roles: [ADMIN]
+      description: |
+        Devuelve el saldo, la comisión y el contador de movimientos de una operación aplicada. Es **idempotente**:
+        revertir dos veces la misma operación devuelve el mismo resultado (200) sin volver a mover dinero.
+
+        - Se aplica **aunque la cuenta esté `INACTIVE`** (compensar es devolver dinero, no operar).
+        - Revertir un depósito exige saldo suficiente (422 `INSUFFICIENT_FUNDS`): el saldo no puede quedar negativo.
+        - Sin cuerpo: todo sale de la operación guardada.
+
+        Errores: 404 `ACCOUNT_NOT_FOUND` u `OPERATION_NOT_FOUND` (la operación no existe en esa cuenta);
+        422 `OPERATION_NOT_APPLIED` (la operación fue rechazada, no hay nada que revertir), `INSUFFICIENT_FUNDS`.
+      responses:
+        '200':
+          description: Movimiento revertido (o resultado original si ya estaba revertido).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReversalResult'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+components:
+
+  parameters:
+    AccountId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+  schemas:
+
+    AccountType:
+      type: string
+      enum: [SAVINGS, CHECKING, FIXED_TERM]
+      description: Ahorro, corriente o plazo fijo. No cambia después de abierta.
+
+    AccountStatus:
+      type: string
+      enum: [ACTIVE, INACTIVE]
+      description: '`INACTIVE` es la baja lógica.'
+
+    MovementType:
+      type: string
+      enum: [DEPOSIT, WITHDRAWAL]
+
+    CustomerType:
+      type: string
+      enum: [PERSONAL, BUSINESS]
+      description: Igual que en `customer-service`.
+
+    CustomerProfile:
+      type: string
+      enum: [STANDARD, VIP, PYME]
+      description: Igual que en `customer-service`.
+
+    ProductId:
+      type: string
+      description: |
+        Id natural de una entrada del catálogo, `<TIPO>_<PERFIL>`. Es la **única excepción** a "los ids son UUID":
+        el catálogo es dato maestro sembrado al arrancar y así es fácil de referenciar.
+      pattern: '^(SAVINGS|CHECKING|FIXED_TERM)_(STANDARD|VIP|PYME)$'
+      example: SAVINGS_VIP
+
+    AccountParty:
+      type: object
+      description: Titular o firmante de una cuenta empresarial. Son datos propios de la cuenta; **no** requieren ser clientes.
+      required: [document, fullName]
+      properties:
+        document:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Document'
+        fullName:
+          type: string
+          minLength: 1
+          maxLength: 150
+          example: Rosa Salas Peña
+
+    AccountConditions:
+      type: object
+      description: |
+        Condiciones de una cuenta. En el catálogo se editan; en la cuenta son una **copia** tomada al abrirla.
+        Los campos opcionales se omiten cuando no aplican.
+      required: [maintenanceFee, minimumOpeningAmount, freeTransactionsLimit, transactionFee, requiresCreditCard]
+      properties:
+        maintenanceFee:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Comisión mensual de mantenimiento. Hoy es informativa (el cobro automático es opcional).
+          example: 15.00
+        minimumOpeningAmount:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Monto mínimo de apertura (puede ser 0).
+          example: 0.00
+        monthlyMovementLimit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: Tope de movimientos por mes. Solo ahorro (10) y plazo fijo (1). Se omite si no hay tope.
+          example: 10
+        freeTransactionsLimit:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: Transacciones sin comisión por mes.
+          example: 5
+        transactionFee:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Comisión por cada transacción pasadas las libres.
+          example: 2.00
+        minimumDailyAverage:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Promedio diario mínimo del mes. Solo ahorro VIP. Informativo, no bloquea.
+          example: 500.00
+        requiresCreditCard:
+          type: boolean
+          description: Si es `true`, el cliente debe tener una tarjeta de crédito `ACTIVE` para abrir la cuenta.
+          example: false
+
+    AccountProduct:
+      type: object
+      description: Entrada del catálogo de condiciones para un (tipo de cuenta, perfil).
+      required: [id, accountType, profile, conditions, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/ProductId'
+        accountType:
+          $ref: '#/components/schemas/AccountType'
+        profile:
+          $ref: '#/components/schemas/CustomerProfile'
+        conditions:
+          $ref: '#/components/schemas/AccountConditions'
+        updatedAt:
+          type: string
+          format: date-time
+
+    MonthlyActivity:
+      type: object
+      description: Movimientos del mes en curso. Se reinicia al cambiar de mes.
+      required: [yearMonth, movementCount]
+      properties:
+        yearMonth:
+          type: string
+          pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+          example: '2026-09'
+        movementCount:
+          type: integer
+          minimum: 0
+          example: 5
+
+    OpenAccountRequest:
+      type: object
+      required: [customerId, type]
+      properties:
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        type:
+          $ref: '#/components/schemas/AccountType'
+        alias:
+          type: string
+          maxLength: 60
+          description: Nombre que el cliente le pone a la cuenta.
+          example: Ahorros del viaje
+        openingAmount:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Monto de apertura. Por defecto 0. Debe ser mayor o igual al mínimo de la condición.
+          default: 0
+        movementDayOfMonth:
+          type: integer
+          minimum: 1
+          maximum: 28
+          description: Día del mes en que se permite el único movimiento. **Obligatorio solo para `FIXED_TERM`**; en otros tipos se rechaza.
+          example: 15
+        holders:
+          type: array
+          maxItems: 10
+          description: 'Titulares. Empresarial: al menos 1. Personal: debe ir vacío u omitido.'
+          items:
+            $ref: '#/components/schemas/AccountParty'
+        signers:
+          type: array
+          maxItems: 10
+          description: 'Firmantes. Empresarial: 0 a n. Personal: debe ir vacío u omitido.'
+          items:
+            $ref: '#/components/schemas/AccountParty'
+
+    UpdateAccountRequest:
+      type: object
+      properties:
+        alias:
+          type: string
+          maxLength: 60
+        holders:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/AccountParty'
+        signers:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/AccountParty'
+
+    Account:
+      type: object
+      required: [id, accountNumber, customerId, customerType, customerProfile, type, balance, currency, conditions, holders, signers, monthlyActivity, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        accountNumber:
+          type: string
+          pattern: '^[0-9]{14}$'
+          description: Número de 14 dígitos, único.
+          example: '00120260924871'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        customerType:
+          $ref: '#/components/schemas/CustomerType'
+        customerProfile:
+          allOf:
+            - $ref: '#/components/schemas/CustomerProfile'
+          description: Perfil del cliente **al abrir** la cuenta (foto; no se actualiza si el cliente cambia de perfil).
+        type:
+          $ref: '#/components/schemas/AccountType'
+        alias:
+          type: string
+        balance:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        currency:
+          type: string
+          enum: [PEN]
+        conditions:
+          $ref: '#/components/schemas/AccountConditions'
+        movementDayOfMonth:
+          type: integer
+          minimum: 1
+          maximum: 28
+          description: Solo `FIXED_TERM`.
+        holders:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountParty'
+        signers:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountParty'
+        monthlyActivity:
+          $ref: '#/components/schemas/MonthlyActivity'
+        status:
+          $ref: '#/components/schemas/AccountStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    DailyAverage:
+      type: object
+      description: Promedio diario del saldo en el mes en curso (saldo al cierre de cada día, desde el inicio del mes o de la apertura).
+      required: [yearMonth, average, minimum, meetsMinimum]
+      properties:
+        yearMonth:
+          type: string
+          pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+        average:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        minimum:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        meetsMinimum:
+          type: boolean
+
+    BalanceView:
+      type: object
+      required: [accountId, balance, currency, asOf]
+      properties:
+        accountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        balance:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        currency:
+          type: string
+          enum: [PEN]
+        asOf:
+          type: string
+          format: date-time
+          description: Momento de la consulta.
+        dailyAverage:
+          $ref: '#/components/schemas/DailyAverage'
+
+    ApplyMovementRequest:
+      type: object
+      required: [operationId, type, amount]
+      properties:
+        operationId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        type:
+          $ref: '#/components/schemas/MovementType'
+        amount:
+          type: number
+          minimum: 0.01
+          multipleOf: 0.01
+          description: Mayor que 0, hasta 2 decimales. (El dominio también responde `INVALID_AMOUNT` cuando el monto llega por Kafka.)
+          example: 150.00
+        date:
+          type: string
+          format: date
+          description: Fecha del movimiento. Por defecto, hoy. Decide la regla del día del plazo fijo y el mes de los contadores.
+
+    MovementResult:
+      type: object
+      description: Resultado inmutable de un movimiento aplicado. Es también el contenido de `account.movement.applied`.
+      required: [operationId, accountId, type, amount, fee, newBalance, movementNumber]
+      properties:
+        operationId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+        accountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        type:
+          $ref: '#/components/schemas/MovementType'
+        amount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        fee:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Comisión cobrada. `0.00` si el movimiento fue libre.
+        newBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo después del movimiento (ya descuenta la comisión).
+        movementNumber:
+          type: integer
+          minimum: 1
+          description: Número de movimiento en el mes (con este incluido).
+
+    ReversalResult:
+      type: object
+      description: Es también el contenido de `account.movement.reversed`.
+      required: [operationId, accountId, newBalance]
+      properties:
+        operationId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/OperationId'
+          description: El de la operación original.
+        accountId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        newBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo después de la reversa.
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

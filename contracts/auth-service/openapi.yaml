@@ -1,0 +1,743 @@
+openapi: 3.0.3
+info:
+  title: auth-service
+  version: 1.0.0
+  description: |
+    Identidad y acceso: **login con documento + contraseña**, emisión del **JWT (RS256)**, usuarios del sistema y registro público de usuarios Yanki.
+    Es la única pieza que firma tokens; el Gateway y los demás servicios los validan **con la clave pública**, sin llamar a este servicio.
+
+    - **Usuarios.** Un usuario por documento (tipo + número) y un usuario por `customerId`. Roles: `ADMIN`, `TELLER`, `CUSTOMER`, `YANKI_USER`.
+      Combinaciones válidas: `[ADMIN]`, `[TELLER]`, `[CUSTOMER]`, `[YANKI_USER]` y `[CUSTOMER, YANKI_USER]`. Regla: tiene rol `CUSTOMER` **si y solo si** tiene `customerId`.
+    - **Login uniforme.** Usuario inexistente, contraseña incorrecta y usuario deshabilitado responden igual: 401 `INVALID_CREDENTIALS`.
+    - **Bloqueo.** 5 fallos consecutivos bloquean 15 minutos (configurable): 423 `ACCOUNT_LOCKED` con `retryAfter`. El fallo que llega al quinto ya responde 423.
+    - **Token.** Solo access token, 30 minutos (configurable). Claims: `sub` (userId), `roles`, `customerId` (si tiene), `documentType`, `documentNumber`, `iss`, `iat`, `exp`, `jti`.
+      Los cambios de roles, estado o cliente vinculado se ven **en el siguiente login**; un usuario deshabilitado conserva su token hasta que venza.
+    - **Verificación del cliente.** Al crear o vincular un usuario `CUSTOMER`, el `customerId` se verifica contra una copia local alimentada por el tópico `customer`
+      (existe, está `ACTIVE` y su documento coincide con el del usuario). Es consistencia eventual: justo después de crear el cliente puede responder 422 `CUSTOMER_NOT_FOUND`; se repite.
+    - **Sin borrado físico.** Eliminar es baja lógica (`status = DISABLED`).
+    - Nunca se devuelve ni se registra en logs una contraseña ni su hash.
+
+    Las rutas `POST /auth/login`, `POST /auth/register` y `GET /.well-known/jwks.json` son **públicas**; el resto exige token cuando `security.enabled=true`.
+    Los roles de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
+servers:
+  - url: /api/v1
+tags:
+  - name: Auth
+    description: Login, registro y perfil propio.
+  - name: Users
+    description: Administración de usuarios.
+  - name: Keys
+    description: Clave pública de firma.
+security:
+  - bearerAuth: []
+
+paths:
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Iniciar sesión
+      security: []
+      x-roles: []
+      description: |
+        **Público.** Valida documento + contraseña y emite el token. En una empresa se usa el RUC del cliente empresarial y su contraseña.
+
+        Un login correcto reinicia el contador de fallos y registra `lastLoginAt`. `mustChangePassword` se **informa** pero no se fuerza: el token sirve igual.
+
+        Errores: 401 `INVALID_CREDENTIALS` (usuario inexistente, contraseña incorrecta o usuario `DISABLED`; no se distingue),
+        423 `ACCOUNT_LOCKED` (mientras dure el bloqueo, **incluso con la contraseña correcta**; el cuerpo trae `retryAfter` y viene el encabezado `Retry-After` en segundos).
+        Ante un fallo por conflicto de versión se reintenta internamente; si se agotan los reintentos: 409 `CONCURRENT_MODIFICATION`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              documentType: DNI
+              documentNumber: '12345678'
+              password: Clave2026x
+      responses:
+        '200':
+          description: Credenciales válidas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              example:
+                accessToken: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImJhbmstMSJ9.eyJzdWIiOiI…
+                tokenType: Bearer
+                expiresIn: 1800
+                mustChangePassword: false
+                user:
+                  id: 7c1e4b2a-93d0-4f6b-8a51-0d2e6f9b3c44
+                  document: { type: DNI, number: '12345678' }
+                  roles: [CUSTOMER]
+                  customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          description: Credenciales inválidas (`INVALID_CREDENTIALS`).
+          content:
+            application/json:
+              schema:
+                $ref: '../common/common-schemas.yaml#/components/schemas/ErrorResponse'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/AccountLocked'
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerYankiUser
+      summary: Registro público de un usuario Yanki
+      security: []
+      x-roles: []
+      description: |
+        **Público.** Crea un usuario con rol `YANKI_USER`. Pide **solo documento y contraseña**: celular, IMEI y correo van después, al crear el monedero en `yanki-service`.
+        No verifica que la persona sea quien dice ser (el demo no tiene verificación de identidad).
+
+        El usuario nace con `mustChangePassword = false`. Para operar debe iniciar sesión con `POST /auth/login`.
+
+        Errores: 400 `VALIDATION_ERROR`; 409 `USER_ALREADY_EXISTS` (el documento ya tiene usuario; si es cliente del banco, usa el usuario que ya tiene);
+        422 `DOCUMENT_TYPE_NOT_ALLOWED` (RUC: las empresas no se registran aquí), `INVALID_DOCUMENT` (el número no cumple el formato de su tipo), `WEAK_PASSWORD`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              documentType: DNI
+              documentNumber: '56789012'
+              password: Yanki2026x
+      responses:
+        '201':
+          description: Usuario creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Perfil del usuario del token
+      x-roles: [ADMIN, TELLER, CUSTOMER, YANKI_USER]
+      description: |
+        Devuelve el usuario tal como está **ahora** (no lo que dice el token): si cambió de roles, cliente vinculado o estado desde el login, aquí se ve.
+        Un usuario deshabilitado con un token todavía vigente recibe 200 con `status = DISABLED`.
+      responses:
+        '200':
+          description: Usuario actual.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+
+  /auth/password:
+    put:
+      tags: [Auth]
+      operationId: changeMyPassword
+      summary: Cambiar mi contraseña
+      x-roles: [ADMIN, TELLER, CUSTOMER, YANKI_USER]
+      description: |
+        Exige la contraseña actual. Limpia `mustChangePassword`. Un fallo de `currentPassword` **no** cuenta para el bloqueo (el token ya prueba la identidad).
+        Los tokens emitidos antes del cambio siguen valiendo hasta que venzan.
+
+        Errores: 400 `VALIDATION_ERROR`; 422 `INVALID_CURRENT_PASSWORD`, `WEAK_PASSWORD`, `PASSWORD_UNCHANGED` (la nueva es igual a la actual).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: Contraseña cambiada.
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /auth/users:
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: Crear un usuario
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Alta por el personal. Crea **un** usuario con **un** rol de `ADMIN`, `TELLER` o `CUSTOMER` (los usuarios `YANKI_USER` solo nacen por `POST /auth/register`).
+        `ADMIN` puede crear cualquiera de los tres; `TELLER` solo `CUSTOMER`. Nace con `mustChangePassword = true` y `status = ACTIVE`.
+
+        **Para `CUSTOMER`** el `customerId` es obligatorio y se verifica contra la copia local: existe, está `ACTIVE`, su documento coincide con el del usuario (RUC para empresas)
+        y no tiene ya un usuario. **Para `ADMIN` y `TELLER`** el `customerId` no se admite y el documento no puede ser RUC.
+        Si el documento ya tiene usuario (por ejemplo, un `YANKI_USER` que luego fue cliente), la respuesta es 409: se le vincula el cliente con `PUT /auth/users/{id}/customer`.
+
+        Errores: 403 `ROLE_NOT_ALLOWED` (un `TELLER` que intenta crear un `TELLER` o un `ADMIN`); 409 `USER_ALREADY_EXISTS`;
+        422 `INVALID_ROLE_COMBINATION` (más de un rol, `YANKI_USER`, `CUSTOMER` sin `customerId` o `ADMIN`/`TELLER` con `customerId`), `DOCUMENT_TYPE_NOT_ALLOWED`,
+        `INVALID_DOCUMENT`, `CUSTOMER_NOT_FOUND`, `CUSTOMER_INACTIVE`, `DOCUMENT_MISMATCH`, `CUSTOMER_ALREADY_LINKED`, `WEAK_PASSWORD`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+            examples:
+              customer:
+                summary: Usuario de un cliente (lo crea un TELLER)
+                value:
+                  document: { type: DNI, number: '12345678' }
+                  roles: [CUSTOMER]
+                  customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+                  temporaryPassword: Temporal2026
+              teller:
+                summary: Un TELLER (lo crea un ADMIN)
+                value:
+                  document: { type: DNI, number: '40404040' }
+                  roles: [TELLER]
+                  temporaryPassword: Temporal2026
+      responses:
+        '201':
+          description: Usuario creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: Listar usuarios
+      x-roles: [ADMIN, TELLER]
+      x-customer-scope: Un `TELLER` solo ve usuarios de clientes (sin rol `ADMIN` ni `TELLER`); los demás no aparecen en la lista.
+      description: |
+        Sin paginación (volumen pequeño). Todos los filtros son opcionales y se combinan con Y. Orden: `createdAt` descendente, empate por `id`.
+        `documentType` solo se usa junto con `documentNumber`.
+      parameters:
+        - name: role
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Role'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/UserStatus'
+        - name: customerId
+          in: query
+          required: false
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        - name: documentType
+          in: query
+          required: false
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/DocumentType'
+        - name: documentNumber
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 6
+            maxLength: 12
+      responses:
+        '200':
+          description: Usuarios que cumplen los filtros (lista vacía si ninguno).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/User'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+
+  /auth/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+    get:
+      tags: [Users]
+      operationId: getUser
+      summary: Obtener un usuario
+      x-roles: [ADMIN, TELLER]
+      x-customer-scope: Un `TELLER` solo ve usuarios de clientes (sin rol `ADMIN` ni `TELLER`); para él, cualquier otro responde 404 `USER_NOT_FOUND`.
+      responses:
+        '200':
+          description: Usuario.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+    put:
+      tags: [Users]
+      operationId: updateUser
+      summary: Actualizar roles y estado
+      x-roles: [ADMIN]
+      description: |
+        Reemplaza los **roles** y el **estado** del usuario. Ambos campos son obligatorios (para cambiar uno, se reenvía el otro sin cambios).
+        Los roles deben formar una combinación válida y respetar `CUSTOMER` ⇔ `customerId`: por aquí **no** se agrega ni se quita `CUSTOMER` (para eso está `PUT /auth/users/{id}/customer`).
+        Pasar de `DISABLED` a `ACTIVE` exige, si el usuario tiene `customerId`, que el cliente siga `ACTIVE`.
+
+        Siempre debe quedar al menos un `ADMIN` activo: quitar el rol o deshabilitar al último responde 422 `LAST_ADMIN`.
+        Los cambios se ven en el siguiente login del usuario.
+
+        Errores 422: `INVALID_ROLE_COMBINATION`, `DOCUMENT_TYPE_NOT_ALLOWED` (un usuario con RUC no puede ser `ADMIN`, `TELLER` ni `YANKI_USER`), `LAST_ADMIN`, `CUSTOMER_INACTIVE`.
+        409 `CONCURRENT_MODIFICATION` si se agotan los reintentos por conflicto de versión.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+            example:
+              roles: [TELLER]
+              status: ACTIVE
+      responses:
+        '200':
+          description: Usuario actualizado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Users]
+      operationId: disableUser
+      summary: Baja lógica de un usuario
+      x-roles: [ADMIN]
+      description: |
+        Pasa el usuario a `DISABLED` (no se borra). Repetir la baja responde 204. Se revierte con `PUT /auth/users/{id}` (`status = ACTIVE`).
+        422 `LAST_ADMIN` si es el último `ADMIN` activo.
+      responses:
+        '204':
+          description: Usuario deshabilitado.
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /auth/users/{id}/customer:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+    put:
+      tags: [Users]
+      operationId: linkCustomer
+      summary: Vincular un cliente del banco a un usuario existente
+      x-roles: [ADMIN, TELLER]
+      x-customer-scope: Un `TELLER` solo vincula usuarios de clientes (típicamente un `YANKI_USER`); un usuario `ADMIN` o `TELLER` responde 404 `USER_NOT_FOUND` para él.
+      description: |
+        Para una persona que ya tenía usuario Yanki y luego se hizo cliente: **conserva su usuario**, se le asigna el `customerId` y se le **agrega** el rol `CUSTOMER`
+        (queda `[CUSTOMER, YANKI_USER]`). Mismas verificaciones que al crear un usuario `CUSTOMER`. El nuevo token, en su siguiente login, trae `customerId`.
+
+        Idempotente: si el usuario ya está vinculado a **ese mismo** `customerId`, responde 200 sin cambios.
+
+        Errores 422: `USER_DISABLED`, `USER_ALREADY_LINKED` (ya tiene **otro** `customerId`), `INVALID_ROLE_COMBINATION` (es `ADMIN` o `TELLER`),
+        `CUSTOMER_NOT_FOUND`, `CUSTOMER_INACTIVE`, `DOCUMENT_MISMATCH`, `CUSTOMER_ALREADY_LINKED` (otro usuario ya tiene ese cliente).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkCustomerRequest'
+      responses:
+        '200':
+          description: Usuario vinculado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /auth/users/{id}/password-reset:
+    parameters:
+      - $ref: '#/components/parameters/UserIdPath'
+    post:
+      tags: [Users]
+      operationId: resetUserPassword
+      summary: Restablecer la contraseña de un usuario
+      x-roles: [ADMIN]
+      description: |
+        Deja una contraseña temporal elegida por el `ADMIN` y `mustChangePassword = true`. También **reinicia el contador de fallos y quita el bloqueo**, por lo que sirve para desbloquear a un usuario.
+        La entrega de la contraseña temporal al usuario queda fuera del sistema. Errores 422: `WEAK_PASSWORD`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '204':
+          description: Contraseña restablecida.
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common-schemas.yaml#/components/responses/Conflict'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+
+  /.well-known/jwks.json:
+    get:
+      tags: [Keys]
+      operationId: getJwks
+      summary: Clave pública de firma (JWKS)
+      security: []
+      x-roles: []
+      servers:
+        - url: /
+      description: |
+        **Público. Fuera de `/api/v1`.** Publica la clave pública RS256 en formato JWKS para validadores externos.
+        El Gateway y los servicios **no** lo usan: reciben la clave pública por Config Server (`security.jwt.public-key`).
+        Con una sola clave activa, `keys` trae un elemento.
+      responses:
+        '200':
+          description: Conjunto de claves públicas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Jwks'
+              example:
+                keys:
+                  - kty: RSA
+                    use: sig
+                    alg: RS256
+                    kid: bank-1
+                    n: 0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw
+                    e: AQAB
+
+components:
+
+  parameters:
+    UserIdPath:
+      name: id
+      in: path
+      required: true
+      description: Identificador del usuario.
+      schema:
+        $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+  responses:
+    AccountLocked:
+      description: Usuario bloqueado por intentos fallidos (`ACCOUNT_LOCKED`). Trae `retryAfter` y el encabezado `Retry-After` (segundos).
+      headers:
+        Retry-After:
+          description: Segundos que faltan para que termine el bloqueo.
+          schema:
+            type: integer
+            example: 840
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountLockedError'
+
+  schemas:
+
+    Role:
+      type: string
+      enum: [ADMIN, TELLER, CUSTOMER, YANKI_USER]
+
+    UserStatus:
+      type: string
+      enum: [ACTIVE, DISABLED]
+
+    Password:
+      type: string
+      format: password
+      writeOnly: true
+      minLength: 8
+      maxLength: 64
+      description: |
+        Mínimo 8 caracteres, con al menos una letra y un número (la política la valida el dominio: 422 `WEAK_PASSWORD`).
+        Máximo 64: BCrypt solo usa los primeros 72 bytes. Nunca se guarda en claro ni se devuelve.
+      example: Clave2026x
+
+    DocumentNumber:
+      type: string
+      minLength: 6
+      maxLength: 12
+      pattern: '^[A-Za-z0-9]{6,12}$'
+      example: '12345678'
+
+    LoginRequest:
+      type: object
+      required: [documentType, documentNumber, password]
+      properties:
+        documentType:
+          $ref: '../common/common-schemas.yaml#/components/schemas/DocumentType'
+        documentNumber:
+          $ref: '#/components/schemas/DocumentNumber'
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 64
+          description: 'Sin mínimo de política: solo se compara con el hash.'
+
+    RegisterRequest:
+      type: object
+      required: [documentType, documentNumber, password]
+      properties:
+        documentType:
+          $ref: '../common/common-schemas.yaml#/components/schemas/DocumentType'
+        documentNumber:
+          $ref: '#/components/schemas/DocumentNumber'
+        password:
+          $ref: '#/components/schemas/Password'
+
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 64
+        newPassword:
+          $ref: '#/components/schemas/Password'
+
+    CreateUserRequest:
+      type: object
+      required: [document, roles, temporaryPassword]
+      properties:
+        document:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Document'
+        roles:
+          type: array
+          description: Exactamente un rol de `ADMIN`, `TELLER` o `CUSTOMER` (lo valida el dominio).
+          minItems: 1
+          maxItems: 1
+          items:
+            $ref: '#/components/schemas/Role'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        temporaryPassword:
+          $ref: '#/components/schemas/Password'
+
+    UpdateUserRequest:
+      type: object
+      required: [roles, status]
+      properties:
+        roles:
+          type: array
+          minItems: 1
+          maxItems: 2
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Role'
+        status:
+          $ref: '#/components/schemas/UserStatus'
+
+    LinkCustomerRequest:
+      type: object
+      required: [customerId]
+      properties:
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+    ResetPasswordRequest:
+      type: object
+      required: [temporaryPassword]
+      properties:
+        temporaryPassword:
+          $ref: '#/components/schemas/Password'
+
+    UserSummary:
+      type: object
+      description: Datos básicos del usuario que se devuelven junto con el token.
+      required: [id, document, roles]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        document:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Document'
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Role'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+
+    LoginResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn, mustChangePassword, user]
+      properties:
+        accessToken:
+          type: string
+          description: JWT firmado con RS256.
+        tokenType:
+          type: string
+          enum: [Bearer]
+        expiresIn:
+          type: integer
+          description: Vigencia en segundos (`security.jwt.access-token-ttl`; 1800 por defecto).
+          example: 1800
+        mustChangePassword:
+          type: boolean
+          description: Solo informativo; no se fuerza.
+        user:
+          $ref: '#/components/schemas/UserSummary'
+
+    User:
+      type: object
+      required: [id, document, roles, status, mustChangePassword, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        document:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Document'
+        roles:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Role'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        mustChangePassword:
+          type: boolean
+        lockedUntil:
+          type: string
+          format: date-time
+          description: Presente solo mientras el bloqueo por intentos fallidos siga vigente.
+        lastLoginAt:
+          type: string
+          format: date-time
+          description: Se omite si nunca inició sesión.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      example:
+        id: 7c1e4b2a-93d0-4f6b-8a51-0d2e6f9b3c44
+        document: { type: DNI, number: '12345678' }
+        roles: [CUSTOMER]
+        customerId: 3f1c9a7e-5b2d-4e8a-9c6f-1a2b3c4d5e6f
+        status: ACTIVE
+        mustChangePassword: true
+        createdAt: '2026-09-24T15:24:00Z'
+        updatedAt: '2026-09-24T15:24:00Z'
+
+    AccountLockedError:
+      allOf:
+        - $ref: '../common/common-schemas.yaml#/components/schemas/ErrorResponse'
+        - type: object
+          required: [retryAfter]
+          properties:
+            retryAfter:
+              type: string
+              format: date-time
+              description: Momento en que termina el bloqueo.
+              example: '2026-09-24T15:39:00Z'
+
+    Jwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/Jwk'
+
+    Jwk:
+      type: object
+      required: [kty, use, alg, kid, n, e]
+      properties:
+        kty:
+          type: string
+          enum: [RSA]
+        use:
+          type: string
+          enum: [sig]
+        alg:
+          type: string
+          enum: [RS256]
+        kid:
+          type: string
+          description: Identificador de la clave (`security.jwt.key-id`). También va en la cabecera del token.
+        n:
+          type: string
+          description: Módulo, base64url.
+        e:
+          type: string
+          description: Exponente, base64url.
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

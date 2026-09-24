@@ -1,0 +1,496 @@
+openapi: 3.0.3
+info:
+  title: report-service
+  version: 1.0.0
+  description: |
+    Reportes de **solo lectura**: reporte completo de un producto en un intervalo de fechas, últimos movimientos de un producto
+    (por defecto 10), últimos 10 movimientos de las tarjetas de un cliente y reporte agregado por categoría de producto.
+    No tiene CRUD ni publica eventos.
+
+    - **Fuente de datos según la fase.** P2: consulta por REST a `account-service`, `credit-service` y `transaction-service`
+      (`report.source=rest`). P3: copia propia alimentada por eventos (`report.source=readmodel`). El contrato es el mismo.
+      Lo que solo existe desde P3 responde **501** `NOT_AVAILABLE` en P2 (tarjetas de débito y reporte por categoría).
+    - **Solo movimientos `COMPLETED`.** Los fallidos, pendientes, descartados y **revertidos** no aparecen ni suman.
+    - "Saldo resultante" significa el saldo de la cuenta, el saldo pendiente del crédito o el monto usado de la tarjeta de crédito,
+      según el producto. En una tarjeta de débito es el saldo de la cuenta que pagó.
+    - Fechas `from`/`to` **inclusivas**, en la zona horaria del banco. El intervalo no puede pasar de 366 días.
+    - Consistencia: en P3 los datos reflejan lo procesado hasta `generatedAt` (consistencia eventual).
+
+    Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
+servers:
+  - url: /api/v1
+tags:
+  - name: Reports
+security:
+  - bearerAuth: []
+
+paths:
+
+  /reports/products/{productType}/{productId}:
+    parameters:
+      - $ref: '#/components/parameters/ProductTypePath'
+      - $ref: '#/components/parameters/ProductIdPath'
+    get:
+      tags: [Reports]
+      operationId: getProductReport
+      summary: Reporte completo de un producto en un intervalo
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo pide reportes de productos suyos (403 si el producto es de otro cliente).
+      description: |
+        Datos del producto, **resumen del intervalo completo** y una página de movimientos (más recientes primero).
+        El resumen no depende de la página pedida: se calcula sobre todos los movimientos del intervalo.
+
+        Resumen: cantidad, total y cantidad por tipo, total de comisiones, saldo inicial (saldo resultante del último movimiento
+        anterior al intervalo) y saldo final (saldo resultante del último movimiento del intervalo). Sin movimientos, los saldos se omiten.
+        La cuenta abierta con un monto inicial no genera un movimiento: sin movimientos anteriores no hay saldo inicial.
+
+        Errores: 400 `INVALID_RANGE` (`from` posterior a `to` o más de 366 días), 404 `PRODUCT_NOT_FOUND`,
+        422 `RANGE_TOO_LARGE` (demasiados movimientos; se rechaza en vez de devolver un reporte parcial),
+        501 `NOT_AVAILABLE` (tarjeta de débito en P2), 503 `SERVICE_UNAVAILABLE` (P2: una fuente no responde en 2 s; no se entregan reportes incompletos).
+      parameters:
+        - $ref: '#/components/parameters/FromRequired'
+        - $ref: '#/components/parameters/ToRequired'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/PageParam'
+        - $ref: '../common/common-schemas.yaml#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: Reporte del producto.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductReport'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+        '501':
+          $ref: '#/components/responses/NotAvailable'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+
+  /reports/products/{productType}/{productId}/last-movements:
+    parameters:
+      - $ref: '#/components/parameters/ProductTypePath'
+      - $ref: '#/components/parameters/ProductIdPath'
+    get:
+      tags: [Reports]
+      operationId: getLastMovements
+      summary: Últimos movimientos de un producto
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo pide productos suyos (403 si es de otro cliente).
+      description: |
+        Los últimos `limit` movimientos `COMPLETED` (10 por defecto), más recientes primero. Con menos movimientos que `limit`, devuelve los que haya.
+        Sirve para tarjetas de crédito y de débito y, en general, para cualquier producto.
+        Errores: 404 `PRODUCT_NOT_FOUND`, 501 `NOT_AVAILABLE` (tarjeta de débito en P2), 503 `SERVICE_UNAVAILABLE` (P2).
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        '200':
+          description: Últimos movimientos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LastMovementsReport'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: '../common/common-schemas.yaml#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotAvailable'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+
+  /reports/customers/{customerId}/cards/last-movements:
+    parameters:
+      - name: customerId
+        in: path
+        required: true
+        schema:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    get:
+      tags: [Reports]
+      operationId: getCustomerCardsLastMovements
+      summary: Últimos 10 movimientos de cada tarjeta de crédito y de débito de un cliente
+      x-roles: [ADMIN, TELLER, CUSTOMER]
+      x-customer-scope: Un `CUSTOMER` solo pide el reporte de sí mismo (`customerId` del token; 403 si es otro).
+      description: |
+        Incluye todas las tarjetas del cliente (también las cerradas o vencidas, con su `status`), cada una con sus últimos 10 movimientos.
+        Un cliente sin tarjetas devuelve listas vacías (no hay 404: este servicio no conoce a los clientes).
+        En **P2** solo se incluyen tarjetas de crédito y `debitCardsIncluded` es `false`; desde P3 se incluyen también las de débito.
+        503 `SERVICE_UNAVAILABLE` (P2).
+      responses:
+        '200':
+          description: Tarjetas del cliente con sus últimos movimientos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerCardsReport'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '503':
+          $ref: '../common/common-schemas.yaml#/components/responses/ServiceUnavailable'
+
+  /reports/product-categories/{category}:
+    parameters:
+      - name: category
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/ProductCategory'
+    get:
+      tags: [Reports]
+      operationId: getCategoryReport
+      summary: Reporte agregado de una categoría de productos del banco
+      x-roles: [ADMIN, TELLER]
+      description: |
+        Suma los movimientos `COMPLETED` de **todos** los productos de la categoría (por ejemplo, todas las cuentas de ahorro) en el intervalo.
+        No incluye saldos inicial y final (no son comparables entre productos). **Solo desde P3**; en P2, 501 `NOT_AVAILABLE`.
+        Errores: 400 `INVALID_RANGE`, 422 `RANGE_TOO_LARGE`.
+      parameters:
+        - $ref: '#/components/parameters/FromRequired'
+        - $ref: '#/components/parameters/ToRequired'
+      responses:
+        '200':
+          description: Reporte de la categoría.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryReport'
+        '400':
+          $ref: '../common/common-schemas.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common-schemas.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common-schemas.yaml#/components/responses/Forbidden'
+        '422':
+          $ref: '../common/common-schemas.yaml#/components/responses/UnprocessableEntity'
+        '501':
+          $ref: '#/components/responses/NotAvailable'
+
+components:
+
+  parameters:
+    ProductTypePath:
+      name: productType
+      in: path
+      required: true
+      description: Tipo de producto en la ruta.
+      schema:
+        type: string
+        enum: [accounts, credits, credit-cards, debit-cards]
+    ProductIdPath:
+      name: productId
+      in: path
+      required: true
+      schema:
+        $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+    FromRequired:
+      name: from
+      in: query
+      required: true
+      description: Fecha inicial del intervalo, inclusive (yyyy-MM-dd).
+      schema:
+        type: string
+        format: date
+    ToRequired:
+      name: to
+      in: query
+      required: true
+      description: Fecha final del intervalo, inclusive (yyyy-MM-dd).
+      schema:
+        type: string
+        format: date
+
+  responses:
+    NotAvailable:
+      description: Lo pedido no está disponible con la fuente de datos actual (P2). Código `NOT_AVAILABLE`.
+      content:
+        application/json:
+          schema:
+            $ref: '../common/common-schemas.yaml#/components/schemas/ErrorResponse'
+
+  schemas:
+
+    ProductType:
+      type: string
+      enum: [ACCOUNT, CREDIT, CREDIT_CARD, DEBIT_CARD]
+
+    ProductCategory:
+      type: string
+      enum: [SAVINGS, CHECKING, FIXED_TERM, PERSONAL_CREDIT, BUSINESS_CREDIT, CREDIT_CARD, DEBIT_CARD]
+      description: |
+        Cuentas por tipo, créditos por tipo de dueño, y tarjetas de crédito y de débito.
+
+    ProductStatus:
+      type: string
+      enum: [ACTIVE, INACTIVE, OVERDUE, PAID, CLOSED]
+      description: |
+        Estado del producto en su servicio: cuentas `ACTIVE`/`INACTIVE`; créditos `ACTIVE`/`OVERDUE`/`PAID`/`CLOSED`;
+        tarjetas de crédito `ACTIVE`/`OVERDUE`/`CLOSED`; tarjetas de débito `ACTIVE`/`CLOSED`.
+
+    MovementType:
+      type: string
+      enum: [DEPOSIT, WITHDRAWAL, TRANSFER_OUT, TRANSFER_IN, FEE, CREDIT_PAYMENT, CARD_PAYMENT, CARD_CHARGE, DEBIT_PAYMENT, YANKI_PAYMENT_OUT, YANKI_PAYMENT_IN]
+
+    Period:
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+
+    ProductHeader:
+      type: object
+      description: Cabecera del reporte. Los campos opcionales dependen del producto y se omiten cuando no aplican.
+      required: [productId, productType, category, customerId, status]
+      properties:
+        productId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        productType:
+          $ref: '#/components/schemas/ProductType'
+        category:
+          $ref: '#/components/schemas/ProductCategory'
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/ProductStatus'
+        maskedNumber:
+          type: string
+          description: Cuentas y tarjetas.
+          example: '**** 4821'
+        creditLimit:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Solo tarjetas de crédito.
+        principalAmount:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Solo créditos.
+        dueDate:
+          type: string
+          format: date
+          description: Solo créditos.
+        linkedAccountIds:
+          type: array
+          description: Solo tarjetas de débito. Cuentas asociadas.
+          items:
+            $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        mainAccountId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Solo tarjetas de débito. Cuenta principal.
+        expiryDate:
+          type: string
+          pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+          description: Solo tarjetas de débito (`yyyy-MM`).
+
+    ReportMovement:
+      type: object
+      description: Un movimiento `COMPLETED` del producto.
+      required: [movementId, type, amount, occurredAt]
+      properties:
+        movementId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        type:
+          $ref: '#/components/schemas/MovementType'
+        amount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+        resultingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo resultante (ver la descripción general).
+        description:
+          type: string
+        transferId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        parentMovementId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: En las comisiones `FEE`, el movimiento que las originó.
+        fee:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Solo en pagos con tarjeta de débito. Comisión cobrada a la cuenta (aparece además como movimiento `FEE` de esa cuenta).
+        accountId:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+          description: Solo en pagos con tarjeta de débito. Cuenta cargada.
+        occurredAt:
+          type: string
+          format: date-time
+
+    TypeTotal:
+      type: object
+      required: [type, count, totalAmount]
+      properties:
+        type:
+          $ref: '#/components/schemas/MovementType'
+        count:
+          type: integer
+        totalAmount:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+
+    ReportSummary:
+      type: object
+      required: [movementsCount, totalsByType, totalFees]
+      properties:
+        movementsCount:
+          type: integer
+          description: Movimientos `COMPLETED` en el intervalo completo (incluye las comisiones `FEE`).
+        totalsByType:
+          type: array
+          description: Un elemento por tipo presente, ordenado por `type`.
+          items:
+            $ref: '#/components/schemas/TypeTotal'
+        totalFees:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Suma de los movimientos `FEE` (0.00 si no hay).
+        openingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo resultante del último movimiento **anterior** al intervalo. Se omite si no lo hay.
+        closingBalance:
+          allOf:
+            - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+          description: Saldo resultante del último movimiento **del** intervalo. Se omite si no hay movimientos en él.
+
+    MovementPage:
+      allOf:
+        - $ref: '../common/common-schemas.yaml#/components/schemas/PageMeta'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReportMovement'
+
+    ProductReport:
+      type: object
+      required: [product, period, summary, movements, generatedAt]
+      properties:
+        product:
+          $ref: '#/components/schemas/ProductHeader'
+        period:
+          $ref: '#/components/schemas/Period'
+        summary:
+          $ref: '#/components/schemas/ReportSummary'
+        movements:
+          $ref: '#/components/schemas/MovementPage'
+        generatedAt:
+          type: string
+          format: date-time
+
+    LastMovementsReport:
+      type: object
+      required: [product, limit, movements, generatedAt]
+      properties:
+        product:
+          $ref: '#/components/schemas/ProductHeader'
+        limit:
+          type: integer
+        movements:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/ReportMovement'
+        generatedAt:
+          type: string
+          format: date-time
+
+    CardMovements:
+      type: object
+      required: [card, movements]
+      properties:
+        card:
+          $ref: '#/components/schemas/ProductHeader'
+        movements:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/ReportMovement'
+
+    CustomerCardsReport:
+      type: object
+      required: [customerId, debitCardsIncluded, creditCards, debitCards, generatedAt]
+      properties:
+        customerId:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Id'
+        debitCardsIncluded:
+          type: boolean
+          description: '`false` en P2 (las tarjetas de débito no están disponibles con la fuente REST).'
+        creditCards:
+          type: array
+          items:
+            $ref: '#/components/schemas/CardMovements'
+        debitCards:
+          type: array
+          items:
+            $ref: '#/components/schemas/CardMovements'
+        generatedAt:
+          type: string
+          format: date-time
+
+    CategorySummary:
+      type: object
+      description: Como `ReportSummary`, sin saldos inicial y final.
+      required: [movementsCount, totalsByType, totalFees]
+      properties:
+        movementsCount:
+          type: integer
+        totalsByType:
+          type: array
+          items:
+            $ref: '#/components/schemas/TypeTotal'
+        totalFees:
+          $ref: '../common/common-schemas.yaml#/components/schemas/Money'
+
+    CategoryReport:
+      type: object
+      required: [category, period, productsCount, productsWithMovements, summary, generatedAt]
+      properties:
+        category:
+          $ref: '#/components/schemas/ProductCategory'
+        period:
+          $ref: '#/components/schemas/Period'
+        productsCount:
+          type: integer
+          description: Productos de la categoría (en cualquier estado).
+        productsWithMovements:
+          type: integer
+          description: Cuántos de ellos tuvieron al menos un movimiento en el intervalo.
+        summary:
+          $ref: '#/components/schemas/CategorySummary'
+        generatedAt:
+          type: string
+          format: date-time
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
