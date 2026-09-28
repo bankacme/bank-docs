@@ -43,7 +43,7 @@ Se evalúan por `order` (el menor primero): primero las de bloqueo y luego las g
 | `deny-account-movements` | `Path=/api/v1/accounts/*/movements/**` | 403 `FORBIDDEN` ("Endpoint interno") |
 | `deny-transaction-records` | `Path=/api/v1/transactions/records` | 403 `FORBIDDEN` ("Endpoint interno") |
 
-Son los endpoints `x-internal` de los contratos (`POST /accounts/{id}/movements`, `POST /accounts/{id}/movements/{operationId}/reversal` y `POST /transactions/records`). En P3 los servicios ya no se llaman por REST y estos endpoints se retiran; la regla queda como defensa adicional.
+Son los endpoints `x-gateway-internal` de los contratos (`POST /accounts/{id}/movements`, `POST /accounts/{id}/movements/{operationId}/reversal` y `POST /transactions/records`). En P3 los servicios ya no se llaman por REST y estos endpoints se retiran; la regla queda como defensa adicional.
 
 ### 3.2 Rutas generales (`order` 10)
 

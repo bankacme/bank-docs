@@ -79,7 +79,7 @@ Un repositorio por microservicio (entregables del enunciado), más los de apoyo.
 
 **Los contratos** viven en `bank-docs/contracts/`. Cada servicio copia su `openapi.yaml` y `common-schemas.yaml` a `src/main/resources/openapi/` (con la misma estructura, para que `../common/...` resuelva) mediante un script sencillo de copia. Una prueba o paso de CI compara la copia con el original. La alternativa (un repositorio `bank-contracts` aparte) queda descartada por ahora para no sumar otro repositorio.
 
-**Ramas y commits:** `main` siempre compila; una rama por paso (`feat/customer-create`); mensajes tipo *Conventional Commits* (`feat:`, `test:`, `docs:`); etiqueta al cerrar cada fase (`p1`, `p2`, `p3`) y cada servicio (`customer-v1`).
+**Ramas y commits:** `main` siempre compila; una rama por paso (`feat/customer-create`); mensajes de commit **siempre en inglés**, tipo *Conventional Commits* (`feat:`, `test:`, `docs:`, `chore:`); etiqueta al cerrar cada fase (`p1`, `p2`, `p3`) y cada servicio (`customer-v1`).
 
 ---
 
@@ -154,7 +154,7 @@ Las cuatro entregas usan la receta R1–R10. Todos los servicios de P1 se constr
 | Paso | Servicio | Ficha y contratos | Qué tiene de particular (y qué se aprende) | Sesiones |
 |---|---|---|---|---|
 | **1.1** | `customer-service` | `services/customer-service.md`, `contracts/customer-service/` | **El servicio modelo.** Una sola rebanada vertical primero (`POST /customers`), luego el resto. Un aggregate, baja lógica, índice único de documento, cliente personal o empresa (RUC). Aprendes el patrón completo | 6 a 8 |
-| **1.2** | `account-service` (reglas básicas) | `services/account-service.md`, `contracts/account-service/` | Reglas por tipo de cliente y de cuenta (1 ahorro, 1 corriente, N plazo fijo; empresas), catálogo de condiciones en Mongo, `Clock`, control optimista. **Primer cliente REST** saliente (a `customer-service`, con timeout). Endpoints internos de movimiento (`x-internal`). Sin VIP/PYME ni comisiones todavía | 7 a 9 |
+| **1.2** | `account-service` (reglas básicas) | `services/account-service.md`, `contracts/account-service/` | Reglas por tipo de cliente y de cuenta (1 ahorro, 1 corriente, N plazo fijo; empresas), catálogo de condiciones en Mongo, `Clock`, control optimista. **Primer cliente REST** saliente (a `customer-service`, con timeout). Endpoints internos de movimiento (`x-gateway-internal`). Sin VIP/PYME ni comisiones todavía | 7 a 9 |
 | **1.3** | `transaction-service` (depósito, retiro, historial) | `services/transaction-service.md`, `contracts/transaction-service/` | Idempotencia por `operationId`, historial de movimientos, `UnitOfWorkPort` (transacción de Mongo), `POST /transactions/records`. Cliente REST a `account-service`. Sin transferencias todavía | 6 a 8 |
 | **1.4** | `credit-service` | `services/credit-service.md`, `contracts/credit-service/` | Créditos, tarjetas de crédito, pagos y consumos; plazos con `Clock`; registro del historial en `transaction-service` (cliente REST). Sin deuda vencida ni pago de terceros todavía | 6 a 8 |
 

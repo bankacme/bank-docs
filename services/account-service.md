@@ -135,7 +135,7 @@ Códigos de rechazo: `INSUFFICIENT_FUNDS`, `ACCOUNT_INACTIVE`, `MONTHLY_LIMIT_EX
 | `AccountProductRepositoryPort` | `findByTypeAndProfile`, `findAll`, `save` | Mongo (P1) |
 | `OperationLogPort` | `find(operationId)`, `save(operation)` | Mongo `account_operations` (P1) |
 | `CustomerLookupPort` | `findById` → `CustomerSnapshot` (tipo, perfil, estado) | REST + circuit breaker (P1/P2) → read model (P3) |
-| `CreditCardLookupPort` | `hasActiveCreditCard(customerId)` (solo estado `ACTIVE`; una tarjeta vencida no cuenta) | REST + circuit breaker (P2) → read model (P3) |
+| `CreditCardLookupPort` | `hasActiveCreditCard(customerId)` (solo estado `ACTIVE`; una tarjeta vencida no cuenta) | No-op, siempre `false` (P1, `credit-service` todavía no existe en la receta 1.4 ni hay condiciones VIP/PYME que lo consulten) → REST + circuit breaker (P2, tarea 2.4) → read model (P3) |
 | `OverdueDebtPort` | `hasOverdueDebt(customerId)` | No-op, siempre `false` (P1/P2) → read model (P3) |
 | `UnitOfWorkPort` | `inTransaction(Single<T>)` | Transacción de Mongo (P1). Escribe `accounts` y `account_operations` juntos; ver `contracts/account-service/data-model.md` 2.4 |
 | `AccountEventPublisherPort` | `publish(event)` | No-op (P1/P2) → Kafka (P3) |
@@ -268,11 +268,15 @@ Los DTOs REST se generan desde el contrato. Los adaptadores `out/rest` y `out/re
 | Controllers y consumers | Contrato, códigos, errores; consumo idempotente | WebTestClient, tests de consumidor |
 | Cobertura | Reporte de todo el código | Jacoco |
 
-## 11. Diagramas a elaborar
-- [ ] Secuencia: abrir cuenta (P1/P2 con REST y P3 con read models)
-- [ ] Secuencia: aplicar retiro con comisión e idempotencia
-- [ ] Secuencia: compensación (reversa) de un movimiento
-- [ ] UML del dominio (`Account`, `AccountProduct` y VO)
+## 11. Diagramas
+- [x] Secuencia: abrir cuenta (P1/P2 con REST y P3 con read models)
+- [x] Secuencia: aplicar retiro con comisión e idempotencia
+- [x] Secuencia: compensación (reversa) de un movimiento
+- [x] UML del dominio (`Account`, `AccountProduct` y VO)
+
+Como en `customer-service`, los diagramas viven en el propio repo del servicio, no aquí:
+`account-service/docs/sequence/` (abrir cuenta, aplicar movimiento, revertir movimiento) y
+`account-service/docs/uml/account-domain.md`.
 
 ## 12. Decisiones y pendientes
 - **Decidido:**

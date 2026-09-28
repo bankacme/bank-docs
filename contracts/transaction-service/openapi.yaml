@@ -13,7 +13,9 @@ info:
     - **Respuesta perdida no es rechazo:** si la cuenta no responde a tiempo, la operación queda pendiente y se responde **202**.
       El cliente (o el proceso de recuperación) reintenta con el **mismo** `operationId`.
     - El historial es **inmutable**: solo se edita la `description` y solo se descartan (baja lógica) los movimientos `FAILED`.
-    - `POST /transactions/records` y `POST /transaction-recovery-runs` no son de uso del cliente final (ver `x-internal`).
+    - `POST /transactions/records` y `POST /transaction-recovery-runs` no son de uso del cliente final (ver `x-gateway-internal`).
+      No se usa la extensión reservada `x-internal`: `openapi-generator` (generador `spring`) la interpreta como
+      "no generar esta operación" y la excluye por completo del código servidor.
 
     Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
 servers:
@@ -401,7 +403,7 @@ paths:
       tags: [Internal]
       operationId: recordExternalMovement
       summary: "Interno: registrar un movimiento de crédito o tarjeta"
-      x-internal: true
+      x-gateway-internal: true
       x-roles: [ADMIN]
       description: |
         Lo usa `credit-service` en P1/P2 (en P3 lo reemplazan los eventos `credit.payment.registered` y `credit.card.charge.registered`).

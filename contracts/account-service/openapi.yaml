@@ -8,8 +8,11 @@ info:
 
     - **Dueño del saldo.** El saldo solo cambia por movimientos (`/accounts/{id}/movements`) y sus reversas.
     - Eliminar una cuenta es una **baja lógica** (`INACTIVE`) y solo con saldo 0.
-    - Los dos endpoints de movimientos son **internos** (`x-internal: true`): los usa `transaction-service` en P1/P2 y
+    - Los dos endpoints de movimientos son **internos** (`x-gateway-internal: true`): los usa `transaction-service` en P1/P2 y
       **no** se publican en el Gateway. En P3 el mismo caso de uso se dispara con comandos de Kafka (`account.command`).
+      No se usa la extensión reservada `x-internal`: `openapi-generator` (generador `spring`) la interpreta como
+      "no generar esta operación" y la excluye por completo del código servidor — justo lo contrario de lo que
+      necesitamos aquí, donde el propio account-service debe implementarla.
     - Los depósitos y retiros que ve el cliente (`POST /deposits`, `POST /withdrawals`) pertenecen a `transaction-service`.
 
     Los roles permitidos de cada operación se indican en `x-roles` y solo se aplican con `security.enabled=true`.
@@ -319,7 +322,7 @@ paths:
       tags: [Internal movements]
       operationId: applyMovement
       summary: "Interno: aplicar un depósito o retiro"
-      x-internal: true
+      x-gateway-internal: true
       x-roles: [ADMIN]
       description: |
         Aplica el movimiento con todas las reglas de la cuenta y **es idempotente por `operationId`**:
@@ -390,7 +393,7 @@ paths:
       tags: [Internal movements]
       operationId: reverseMovement
       summary: "Interno: revertir (compensar) un movimiento"
-      x-internal: true
+      x-gateway-internal: true
       x-roles: [ADMIN]
       description: |
         Devuelve el saldo, la comisión y el contador de movimientos de una operación aplicada. Es **idempotente**:
@@ -568,8 +571,10 @@ components:
         openingAmount:
           allOf:
             - $ref: '../common/common-schemas.yaml#/components/schemas/Money'
-          description: Monto de apertura. Por defecto 0. Debe ser mayor o igual al mínimo de la condición.
-          default: 0
+          description: >-
+            Monto de apertura. Si se omite, el servicio lo trata como 0 (no es un default
+            del esquema: openapi-generator no genera bien un valor por defecto BigDecimal
+            combinado con allOf). Debe ser mayor o igual al mínimo de la condición.
         movementDayOfMonth:
           type: integer
           minimum: 1
